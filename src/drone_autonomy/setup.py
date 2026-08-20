@@ -27,7 +27,7 @@ setup(
         'console_scripts': [
             'takeoff_node = drone_autonomy.takeoff_node:main',
             'waypoint_nav_node = drone_autonomy.waypoint_nav_node:main',
-            'fake_lidar_node = drone_autonomy.fake_lidar_node:main',
+            'virtual_lidar_node = drone_autonomy.virtual_lidar_node:main',
             'obstacle_nav_node = drone_autonomy.obstacle_nav_node:main',
             'nav2_obstacle_node = drone_autonomy.nav2_obstacle_node:main',
         ],

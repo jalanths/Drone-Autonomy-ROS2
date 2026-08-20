@@ -6,7 +6,7 @@ A complete ROS 2 autonomous drone navigation framework utilizing ArduPilot, MAVR
 - **ROS 2 Integration:** Fully built on the ROS 2 ecosystem.
 - **ArduCopter & MAVROS:** Seamless flight control and telemetry streaming to offboard navigation nodes.
 - **Nav2 Autonomy Stack:** Real-time path planning globally and locally using the Nav2 framework.
-- **Dynamic Obstacle Avoidance:** Utilizes a LiDAR (or `fake_lidar_node` in SITL) with Nav2 costmaps to dynamically dodge obstacles during flight.
+- **Dynamic Obstacle Avoidance:** Utilizes a LiDAR (or `virtual_lidar_node` in SITL) with Nav2 costmaps to dynamically dodge obstacles during flight.
 
 ## 🏗️ Hardware & Software Architecture Diagram
 ```mermaid
@@ -18,7 +18,7 @@ graph TD
     end
 
     subgraph "ROS 2 Software Stack (Companion Computer)"
-        FakeLidar[fake_lidar_node.py]
+        FakeLidar[virtual_lidar_node.py]
         Nav2[Nav2 Costmap & Planners]
         ObstacleNode[nav2_obstacle_node.py]
         MavrosNode[MAVROS Node]

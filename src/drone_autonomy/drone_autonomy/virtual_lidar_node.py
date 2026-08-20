@@ -15,7 +15,7 @@ When the real RPLiDAR is connected, you simply stop running this node
 and launch sllidar_ros2 instead. The /scan topic format is identical.
 
 Usage:
-  python3 fake_lidar_node.py
+  python3 virtual_lidar_node.py
 """
 
 import rclpy
@@ -27,7 +27,7 @@ import time
 
 class FakeLidarNode(Node):
     def __init__(self):
-        super().__init__('fake_lidar_node')
+        super().__init__('virtual_lidar_node')
 
         # ── Lidar specs (matching RPLiDAR C1M1-R2) ──────────────
         self.angle_min = -math.pi        # -180 degrees

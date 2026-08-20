@@ -21,7 +21,7 @@ and most reliable strategy for real-world drones with 2D Lidar.
 Usage:
   Terminal 1: cd ~/ardupilot/ArduCopter && sim_vehicle.py --console --map
   Terminal 2: ros2 run mavros mavros_node --ros-args -p fcu_url:="udp://127.0.0.1:14550@"
-  Terminal 3: python3 fake_lidar_node.py   (simulates obstacles)
+  Terminal 3: python3 virtual_lidar_node.py   (simulates obstacles)
   Terminal 4: python3 obstacle_nav_node.py (this file)
 """
 

@@ -1,0 +1,13 @@
+Metadata-Version: 2.4
+Name: drone_autonomy
+Version: 0.0.0
+Summary: Autonomous logic for Tarot 650 with ROS 2 and MAVROS
+Maintainer: jalanth
+Maintainer-email: user@example.com
+License: TODO: License declaration
+Requires-Dist: setuptools
+Dynamic: license
+Dynamic: maintainer
+Dynamic: maintainer-email
+Dynamic: requires-dist
+Dynamic: summary

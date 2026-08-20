@@ -1,0 +1,28 @@
+[0.458s] Invoking command in '/home/jalanth/Downloads/ROBO/drone_ws/src/drone_autonomy': PYTHONPATH=/home/jalanth/Downloads/ROBO/drone_ws/build/drone_autonomy/prefix_override:/usr/lib/python3/dist-packages/colcon_core/task/python/colcon_distutils_commands:/home/jalanth/Downloads/ROBO/drone_ws/install/drone_autonomy/lib/python3.10/site-packages:${PYTHONPATH} /usr/bin/python3 -W ignore:setup.py install is deprecated -W ignore:easy_install command is deprecated setup.py egg_info --egg-base ../../build/drone_autonomy build --build-base /home/jalanth/Downloads/ROBO/drone_ws/build/drone_autonomy/build install --record /home/jalanth/Downloads/ROBO/drone_ws/build/drone_autonomy/install.log --single-version-externally-managed install_data
+[0.656s] running egg_info
+[0.667s] writing ../../build/drone_autonomy/drone_autonomy.egg-info/PKG-INFO
+[0.668s] writing dependency_links to ../../build/drone_autonomy/drone_autonomy.egg-info/dependency_links.txt
+[0.668s] writing entry points to ../../build/drone_autonomy/drone_autonomy.egg-info/entry_points.txt
+[0.668s] writing requirements to ../../build/drone_autonomy/drone_autonomy.egg-info/requires.txt
+[0.668s] writing top-level names to ../../build/drone_autonomy/drone_autonomy.egg-info/top_level.txt
+[0.691s] reading manifest file '../../build/drone_autonomy/drone_autonomy.egg-info/SOURCES.txt'
+[0.692s] writing manifest file '../../build/drone_autonomy/drone_autonomy.egg-info/SOURCES.txt'
+[0.692s] running build
+[0.692s] running build_py
+[0.692s] copying drone_autonomy/nav2_obstacle_node.py -> /home/jalanth/Downloads/ROBO/drone_ws/build/drone_autonomy/build/lib/drone_autonomy
+[0.692s] running install
+[0.695s] running install_lib
+[0.706s] copying /home/jalanth/Downloads/ROBO/drone_ws/build/drone_autonomy/build/lib/drone_autonomy/nav2_obstacle_node.py -> /home/jalanth/Downloads/ROBO/drone_ws/install/drone_autonomy/lib/python3.10/site-packages/drone_autonomy
+[0.707s] byte-compiling /home/jalanth/Downloads/ROBO/drone_ws/install/drone_autonomy/lib/python3.10/site-packages/drone_autonomy/nav2_obstacle_node.py to nav2_obstacle_node.cpython-310.pyc
+[0.708s] running install_data
+[0.709s] running install_egg_info
+[0.721s] removing '/home/jalanth/Downloads/ROBO/drone_ws/install/drone_autonomy/lib/python3.10/site-packages/drone_autonomy-0.0.0-py3.10.egg-info' (and everything under it)
+[0.721s] Copying ../../build/drone_autonomy/drone_autonomy.egg-info to /home/jalanth/Downloads/ROBO/drone_ws/install/drone_autonomy/lib/python3.10/site-packages/drone_autonomy-0.0.0-py3.10.egg-info
+[0.721s] running install_scripts
+[0.745s] Installing fake_lidar_node script to /home/jalanth/Downloads/ROBO/drone_ws/install/drone_autonomy/lib/drone_autonomy
+[0.745s] Installing nav2_obstacle_node script to /home/jalanth/Downloads/ROBO/drone_ws/install/drone_autonomy/lib/drone_autonomy
+[0.745s] Installing obstacle_nav_node script to /home/jalanth/Downloads/ROBO/drone_ws/install/drone_autonomy/lib/drone_autonomy
+[0.745s] Installing takeoff_node script to /home/jalanth/Downloads/ROBO/drone_ws/install/drone_autonomy/lib/drone_autonomy
+[0.746s] Installing waypoint_nav_node script to /home/jalanth/Downloads/ROBO/drone_ws/install/drone_autonomy/lib/drone_autonomy
+[0.746s] writing list of installed files to '/home/jalanth/Downloads/ROBO/drone_ws/build/drone_autonomy/install.log'
+[0.762s] Invoked command in '/home/jalanth/Downloads/ROBO/drone_ws/src/drone_autonomy' returned '0': PYTHONPATH=/home/jalanth/Downloads/ROBO/drone_ws/build/drone_autonomy/prefix_override:/usr/lib/python3/dist-packages/colcon_core/task/python/colcon_distutils_commands:/home/jalanth/Downloads/ROBO/drone_ws/install/drone_autonomy/lib/python3.10/site-packages:${PYTHONPATH} /usr/bin/python3 -W ignore:setup.py install is deprecated -W ignore:easy_install command is deprecated setup.py egg_info --egg-base ../../build/drone_autonomy build --build-base /home/jalanth/Downloads/ROBO/drone_ws/build/drone_autonomy/build install --record /home/jalanth/Downloads/ROBO/drone_ws/build/drone_autonomy/install.log --single-version-externally-managed install_data

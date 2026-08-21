@@ -33,3 +33,15 @@ graph TD
     Lidar <-->|USB / I2C| CC
     MavrosNode <-->|UART / USB Serial MAVLink| FC
 ```
+
+## 🧠 Obstacle Avoidance Algorithm & Sensor Setup
+
+### Sensor Setup: 2D 360-Degree LiDAR
+The system currently relies on a **2D 360-degree LiDAR** (such as the RPLiDAR C1) spinning at a fixed rate, which outputs a `/scan` topic covering all directions in a flat horizontal plane. The Nav2 framework takes this point cloud and maps it onto a real-time, cell-based 2D Costmap around the drone, artificially inflating the walls to create a buffer zone. 
+
+### Custom Reactive Ego-Centric Sector Algorithm
+Instead of standard path planning formulas (A*, DWB), this project uses a bespoke, high-performance logic optimized for ArduPilot's physics:
+1. **Grid Extraction**: `nav2_obstacle_node.py` extracts a precise 100x100 cell window (representing the immediate flight zone) from the Nav2 Global Costmap.
+2. **Sector Division**: The window is split into three ego-centric zones (Front, Left, Right) relative to the drone's nose.
+3. **Danger Evaluation**: If the 'Front' sector cost exceeds a calibrated safety threshold, the drone stops waypoint tracking.
+4. **Reactive Escape**: It compares the 'Left' and 'Right' sector densities and injects high-priority MAVROS velocity (`Twist`) commands targeting the clearest path. If both are blocked, it executes a 'Trapped' logic block, reversing out of danger.

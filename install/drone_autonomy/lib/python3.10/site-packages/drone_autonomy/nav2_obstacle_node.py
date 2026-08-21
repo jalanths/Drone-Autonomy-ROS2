@@ -53,7 +53,11 @@ class Nav2ObstacleNode(Node):
             (-35.36300, 149.16550, 599.0),  # WP6
         ]
         self.current_wp_index = 0
-        self.wp_reached_threshold = 3.0
+        self.wp_reached_threshold = 6.0
+
+        self.breadcrumbs = []
+        self.last_breadcrumb = None
+        self.is_retracing = False
 
         self.phase = 'CONNECTING'
         self.takeoff_alt = 15.0
@@ -125,8 +129,8 @@ class Nav2ObstacleNode(Node):
         
         # Check a 2-meter grid (20 cells at 0.1m resolution) directly ahead (x direction)
         search_radius = 20
-        # Use a 15-cell gap between sectors so inflated costs don't bleed across  
-        gap = 15
+        # Use a 6-cell gap (±0.6m) to represent exactly the physical width of the drone corridor
+        gap = 6
         
         front_cells = self.costmap[cy - gap: cy + gap, cx: cx + search_radius]
         left_cells  = self.costmap[cy + gap: cy + search_radius, cx: cx + search_radius]
@@ -191,15 +195,32 @@ class Nav2ObstacleNode(Node):
         if self.phase == 'NAVIGATE':
             # Are we done?
             if self.current_wp_index >= len(self.waypoints):
-                self.get_logger().info('✅ ALL WAYPOINTS REACHED! Triggering RTL.')
-                self.set_mode('RTL')
-                self.phase = 'RTL'
-                return
+                if not self.is_retracing:
+                    self.get_logger().info(f'✅ PATROL COMPLETE! Retracing {len(self.breadcrumbs)} breadcrumbs back to home...')
+                    self.waypoints = list(reversed(self.breadcrumbs))
+                    self.current_wp_index = 0
+                    self.is_retracing = True
+                    return
+                else:
+                    self.get_logger().info('✅ RETRACE COMPLETE! Triggering final landing (RTL).')
+                    self.set_mode('RTL')
+                    self.phase = 'RTL'
+                    return
+
+            # Record breadcrumb every 30 meters of travel (only during outbound patrol)
+            if not self.is_retracing:
+                if self.last_breadcrumb is None or self.haversine(self.current_lat, self.current_lon, self.last_breadcrumb[0], self.last_breadcrumb[1]) > 30.0:
+                    # Use AMSL altitude (same as waypoints), NOT relative takeoff_alt!
+                    cruise_alt = self.waypoints[0][2]  # 599.0 AMSL
+                    self.breadcrumbs.append((self.current_lat, self.current_lon, cruise_alt))
+                    self.last_breadcrumb = (self.current_lat, self.current_lon)
 
             target_lat, target_lon, target_alt = self.waypoints[self.current_wp_index]
             dist = self.haversine(self.current_lat, self.current_lon, target_lat, target_lon)
 
-            if dist < self.wp_reached_threshold:
+            # Use wider acceptance radius during retrace (ArduPilot brakes early on short hops)
+            threshold = 15.0 if self.is_retracing else self.wp_reached_threshold
+            if dist < threshold:
                 self.get_logger().info(f'📍 Waypoint {self.current_wp_index + 1} REACHED!')
                 self.current_wp_index += 1
                 return
@@ -208,6 +229,7 @@ class Nav2ObstacleNode(Node):
             front_cost, left_cost, right_cost = self.scan_costmap_sectors()
 
             if front_cost > self.danger_cell_cost:
+                self.was_dodging = True
                 self.get_logger().warn(f'🚨 INFLATED WALL DETECTED AHEAD (Cost {front_cost}/100)! DODGING!')
                 
                 # Check if trapped!
@@ -226,10 +248,11 @@ class Nav2ObstacleNode(Node):
                     global_max = np.max(self.costmap) if self.costmap is not None else 0
                     self.get_logger().info(f'✅ Path clear. (MapMax:{global_max} F:{front_cost} L:{left_cost} R:{right_cost}) Navigatng to WP {self.current_wp_index + 1}. Dist: {int(dist)}m')
                     
-                # If we're safely far from waypoints, send global GPS setpoints(target_lat, target_lon, target_alt)
+                # Send GPS position target — ArduPilot handles the flight
                 self.publish_global_setpoint(target_lat, target_lon, target_alt)
 
-    # ── Helpers (same as before) ───────────────────────────────────
+    # ── Helpers ───────────────────────────────────────────────────
+
     def send_velocity(self, vx, vy, vz):
         msg = Twist()
         msg.linear.x = float(vx)

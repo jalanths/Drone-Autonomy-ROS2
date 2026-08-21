@@ -74,39 +74,39 @@ class FakeLidarNode(Node):
         ranges = [11.9] * self.num_readings
 
         # ── Dynamic Obstacle Logic ──
-        # Time-based sequence (loops every 80 seconds)
-        cycle_time = elapsed % 80.0
+        # Time-based sequence (loops every 90 seconds)
+        cycle_time = elapsed % 90.0
         
         obs_active = False
         center = 180
         width = 0
         dist = 2.0
 
-        if 10.0 <= cycle_time < 20.0:
+        if 5.0 <= cycle_time < 20.0:
+            # Block ALL 4 SIDES -> Forces Dodge UPWARDS (360 TRAP)
+            obs_active = True
+            center, width, dist = 180, 360, 1.8  # full 360 width
+            if cycle_time - 5.0 < 0.15: self.get_logger().info('🚨 SCRIPT: TRAPPING 360 DEGREES! Forcing UPWARDS escape!')
+
+        elif 25.0 <= cycle_time < 35.0:
             # Block Right-Front -> Forces Dodge LEFT
             obs_active = True
             center, width, dist = 145, 60, 2.0
-            if cycle_time - 10.0 < 0.15: self.get_logger().info('🧱 SCRIPT: Blocking RIGHT, forcing left dodge!')
+            if cycle_time - 25.0 < 0.15: self.get_logger().info('🧱 SCRIPT: Blocking RIGHT, forcing left dodge!')
         
-        elif 30.0 <= cycle_time < 40.0:
+        elif 40.0 <= cycle_time < 50.0:
             # Block Left-Front -> Forces Dodge RIGHT
             obs_active = True
             center, width, dist = 215, 60, 2.0
-            if cycle_time - 30.0 < 0.15: self.get_logger().info('🧱 SCRIPT: Blocking LEFT, forcing right dodge!')
+            if cycle_time - 40.0 < 0.15: self.get_logger().info('🧱 SCRIPT: Blocking LEFT, forcing right dodge!')
             
-        elif 50.0 <= cycle_time < 60.0:
+        elif 55.0 <= cycle_time < 65.0:
             # Block Front, Left, AND Right -> Forces Dodge BACKWARDS
             obs_active = True
             center, width, dist = 180, 160, 1.8
-            if cycle_time - 50.0 < 0.15: self.get_logger().info('🧱 SCRIPT: Trapping FRONT/LEFT/RIGHT, forcing BACKWARDS dodge!')
+            if cycle_time - 55.0 < 0.15: self.get_logger().info('🧱 SCRIPT: Trapping FRONT/LEFT/RIGHT, forcing BACKWARDS dodge!')
             
-        elif 60.0 <= cycle_time < 70.0:
-            # Block ALL SIDES (360 degrees) -> Forces Ascend UPWARDS
-            obs_active = True
-            center, width, dist = 180, 360, 1.8
-            if cycle_time - 60.0 < 0.15: self.get_logger().info('🚨 SCRIPT: FULL 360° TRAP ACTIVE!')
-            
-        elif 70.0 <= cycle_time < 80.0:
+        elif 65.0 <= cycle_time < 90.0:
             # Clear sky
             pass
             if cycle_time - 65.0 < 0.15: self.get_logger().info('✅ SCRIPT: Clear skies!')

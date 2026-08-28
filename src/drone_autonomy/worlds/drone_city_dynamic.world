@@ -1,7 +1,31 @@
 <?xml version="1.0" ?>
 <sdf version="1.6">
   <world name="drone_city_dynamic">
-    <gui><camera name="user_camera"><pose>-40 -40 30 0 0.5 0.8</pose></camera></gui>
+    <!-- Locked chase camera: sits 4.5 m directly behind the drone and 1.2 m
+         above it, for the whole flight. Close and LOW on purpose — near the
+         drone's own eye level, so the airframe fills the frame and the street
+         ahead (and whatever is about to cross it) is visible past it. static=true makes the offset rigid,
+         so the drone never drifts out of frame; inherit_yaw makes the camera
+         swing round with the airframe's heading, so "behind" stays behind on
+         every leg. Roll and pitch are NOT inherited, so the horizon stays
+         level even when the drone banks hard.
+
+         This pairs with the yaw policy in mission_params.yaml: yaw is frozen
+         while avoidance is steering, so during a dodge the camera holds its
+         heading and the drone visibly slides SIDEWAYS across the frame.
+         That is what makes an avoidance manoeuvre readable on video. -->
+    <gui>
+      <camera name="user_camera">
+        <pose>-40 -40 30 0 0.5 0.8</pose>
+        <track_visual>
+          <name>iris_demo</name>
+          <static>true</static>
+          <use_model_frame>true</use_model_frame>
+          <xyz>-4.5 0 1.2</xyz>
+          <inherit_yaw>true</inherit_yaw>
+        </track_visual>
+      </camera>
+    </gui>
     <physics type="ode">
       <ode><solver><type>quick</type><iters>100</iters><sor>1.0</sor></solver></ode>
       <real_time_update_rate>-1</real_time_update_rate>

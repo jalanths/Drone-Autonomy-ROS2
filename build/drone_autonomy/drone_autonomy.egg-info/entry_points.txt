@@ -1,6 +1,0 @@
-[console_scripts]
-fake_lidar_node = drone_autonomy.fake_lidar_node:main
-nav2_obstacle_node = drone_autonomy.nav2_obstacle_node:main
-obstacle_nav_node = drone_autonomy.obstacle_nav_node:main
-takeoff_node = drone_autonomy.takeoff_node:main
-waypoint_nav_node = drone_autonomy.waypoint_nav_node:main

@@ -102,7 +102,7 @@ class AutonomousTakeoffNode(Node):
 
         # ── STEP 4: Takeoff to 15 meters ─────────────────────────
         if not self.takeoff_sent:
-            self.takeoff(altitude=15.0)
+            self.takeoff(altitude=5.0)
             return
 
     # ══════════════════════════════════════════════════════════════

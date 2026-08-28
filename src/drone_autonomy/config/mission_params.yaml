@@ -1,0 +1,395 @@
+# ══════════════════════════════════════════════════════════════════════════
+#  6-Waypoint mission + VFH+ avoidance tuning
+# ══════════════════════════════════════════════════════════════════════════
+
+mission_avoidance_node:
+  ros__parameters:
+    use_sim_time: true
+
+    # ── The route ─────────────────────────────────────────────────────────
+    # Authored in GAZEBO world coordinates — i.e. exactly the numbers shown
+    # in the Gazebo GUI when you click a model. The node converts to the ENU
+    # frame MAVROS reports using enu = (-gz_y, +gz_x); see the node docstring
+    # for the derivation from <gazeboXYZToNED> in the Iris SDF.
+    #
+    # Every waypoint sits in FREE space, but the LEGS BETWEEN THEM deliberately
+    # cut through obstacle fields, which is what forces avoidance to engage:
+    #
+    #   HOME -> WP1  main road east .................. dynamic block crosses
+    #   WP1  -> WP2  clips skyscraper at (50,30) ...... static tower, 45 m tall
+    #   WP2  -> WP3  straight through tower (50,50) ... static tower
+    #   WP3  -> WP4  threads the x=30 tower column .... + dynamic block
+    #   WP4  -> WP5  open park (trees are 3.1 m, below
+    #                the 4 m cruise, so they clear) ... + dynamic block
+    #   WP5  -> WP6  diagonal across the suburb, whose
+    #                roofs reach 7.5 m ................ dense static field
+    #
+    # waypoint_frame: 'gazebo' | 'enu'
+    waypoint_frame: 'gazebo'
+    waypoints:
+      [ 40.0,   0.0,
+        60.0,  40.0,
+        40.0,  60.0,
+         0.0,  55.0,
+       -50.0,  40.0,
+        -1.0,  18.0 ]   # WP6 relocated 2026-08-27, see note below
+
+    # WP6 WAS gazebo (-8, -32) = ENU (32, -8) and was never once reached in
+    # eight attempts. The reason is geometric, not a bug: that point sits in a
+    # street gap with suburb_house_7's edge at x=29 and suburb_car_6 just
+    # 1.9 m away, while the costmap inflates every obstacle by 2.0 m and the
+    # proximity guard retreats from anything within 1.5 m ahead. The clearance
+    # the drone must keep is larger than the gap the waypoint sits in, so it
+    # approached, tripped a guard, retreated, and repeated — closest approach
+    # 14.9 m.
+    #
+    # The new point, gazebo (-1, 18) = ENU (-18, -1), has 19.5 m to the
+    # nearest static obstacle and 19.2 m to the closest dynamic-block swept
+    # path. It is also only 18 m from home, which shortens the retrace.
+
+    # ── Flight envelope ───────────────────────────────────────────────────
+    cruise_altitude: 4.0      # m AGL — HARD REQUIREMENT, never exceeded.
+                              # max_escape_altitude is pinned to the same value,
+                              # which disables vertical escape entirely: the
+                              # drone may not climb over anything, so every
+                              # obstacle must be solved by steering around it.
+                              # A trap therefore resolves via TRAPPED-SQUEEZE
+                              # (push toward the roomiest bearing) instead of
+                              # climbing. Tighter than is ideal for a reactive
+                              # planner, but it is the specified envelope.
+
+    wp_radius: 3.0            # m — arrival tolerance for waypoints 1..n-1
+    final_wp_radius: 1.0      # m — the LAST waypoint is the mission's stated
+                              # destination, so it gets a real terminal approach
+                              # instead of being declared reached up to 3 m out.
+    final_approach_speed: 0.25 # m/s — creep speed inside the terminal zone.
+                              # Below min_speed on purpose: min_speed exists so
+                              # the drone never stalls while TRAVELLING, but
+                              # 0.8 m/s at 10 Hz overshoots a 1 m ball.
+    final_approach_timeout_s: 30.0
+                              # s — if the tight radius cannot be met (the
+                              # waypoint sits inside an inflated obstacle, say),
+                              # fall back to wp_radius rather than livelock.
+
+    control_rate_hz: 20.0     # Hz — decision + setpoint rate. Must match the
+                              # LiDAR's update_rate in
+                              # iris_with_ardupilot/model.sdf, which this project
+                              # also raises 10 -> 20 Hz. threat_persist_ticks is
+                              # counted in SCANS, so doubling the rate halves
+                              # confirmation latency (200 ms -> 100 ms) without
+                              # weakening noise rejection at all: the two ticks
+                              # are still two independent scans.
+
+    # ── Command smoothing ─────────────────────────────────────────────────
+    # Every setpoint change used to be a STEP. Braking from cruise to a dead
+    # stop in one tick demands ~15 m/s² (1.5 g); ArduPilot chases it with a
+    # hard pitch-up, overshoots, and rings. Measured against the IMU on the
+    # 2026-08-27 flight, brake windows showed 6.7° median / 14.9° peak attitude
+    # excursions and 35 °/s median / 56 °/s peak body rates, versus 0.2° and
+    # 1.2 °/s while cruising — a ~30x jump, with the roll rate changing sign
+    # 1.7-2.5 times a second. That sign flipping is the giveaway: it is
+    # ringing, not a clean stop.
+    max_accel: 2.0            # m/s² — horizontal setpoint slew limit. Holds the
+                              # demand near 11.5° of tilt and REACHES it
+                              # smoothly. Stopping from 1.5 m/s takes 0.75 s and
+                              # 0.56 m, which the faster decision loop above
+                              # more than pays for.
+    max_accel_z: 1.5          # m/s² — same idea vertically.
+    # Lowered 1.5 -> 0.8 on 2026-08-27. Reaction distance scales directly
+    # with speed: at 1.5 m/s the drone had roughly half a second between
+    # detecting something in a tight street and reaching it, which is less
+    # than the settling time of its own brake. At 0.8 m/s every guard already
+    # built — TTC brake, back-off, trap squeeze — gets about double the time
+    # to act. Seven flights were lost at 1.5 m/s.
+    #
+    # min_speed MUST stay below this. It was 0.8, identical to the new cruise
+    # speed, which would have pinned the drone to a constant velocity and
+    # disabled every "ease off when it is tight" rule in run_leg.
+    cruise_speed: 0.8         # m/s — reaction distance scales with this
+    min_speed: 0.4            # m/s — floor so the drone never fully stalls
+    takeoff_settle_s: 12.0
+
+    # ── VFH+ avoidance ────────────────────────────────────────────────────
+    lookahead: 10.0           # m — steering horizon (scan + costmap fused)
+    safety_radius: 1.0        # m — drives the angular-enlargement half-angle
+                              # The costmap inflation layer already blocks ~0.8 m
+                              # around every obstacle at blocked_cost=60, so this
+                              # stacks to ~1.8 m effective — 3x the airframe radius.
+    blocked_cost: 60          # 0..100 OccupancyGrid scale (100 = lethal)
+    costmap_alt_band: 1.5     # m above cruise_altitude beyond which the 2D
+                              # costmap is IGNORED. It has no height concept and
+                              # accumulates obstacles seen at every altitude, so
+                              # after an escape climb it vetoes directions using
+                              # buildings the drone is now flying above — and a
+                              # horizontal LiDAR up there returns nothing, so
+                              # those stale marks never get raytraced away.
+    sector_count: 72          # 5 deg per polar bin
+    self_filter_range: 0.7    # m — ignore propellers. MUST be < hard_stop_distance. The drone
+                              # sees its OWN spinning propellers at ~0.3 m in a
+                              # fixed body-frame arc; unfiltered they flicker
+                              # (blades sweep), which reads as huge closing
+                              # speed and fires the collision guard nonstop.
+    max_beam_z_offset: 2.0    # m — reject beams whose hit point sits further
+                              # than this above/below the drone. The LiDAR is
+                              # only horizontal when the airframe is level; under
+                              # hard banking the beam plane tips and sweeps the
+                              # ground, and those terrain hits look exactly like
+                              # a wall. Skimming 7.6 m over 7.5 m rooftops the
+                              # drone reported obstacles at ~1 m from SIX
+                              # bearings at once, called it a 360-degree trap,
+                              # banked harder, and flipped.
+    min_valley_deg: 18.0      # reject gaps too narrow to fly through
+    goal_weight: 1.0          # pull toward the waypoint
+    hysteresis_weight: 0.8    # commit to one side instead of dithering.
+                              # Raised from 0.35: the drone was flip-flopping
+                              # LEFT(136°)->RIGHT(55°)->LEFT(105°) within
+                              # seconds, which upset ArduPilot's EKF.
+    max_heading_rate: 45.0    # deg/s cap on how fast the commanded course may
+                              # slew. Obstacles do not move faster than this;
+                              # the oscillation was self-inflicted.
+
+    # ── Yaw ───────────────────────────────────────────────────────────────
+    # The LiDAR is a full 360-deg sensor, so nose direction buys nothing for
+    # perception — it is cosmetic, and it is NOT free. Slewing yaw while the
+    # velocity vector also swings is what produced "Check mag field" and
+    # "EKF3 Roll/Pitch inconsistent", ending in an EKF failsafe + crash-disarm.
+    # Yaw is additionally frozen outright while avoidance is actively steering.
+    yaw_gain: 0.4
+    max_yaw_rate: 0.4         # rad/s (was effectively 1.5)
+
+    # ── Vertical trap escape ──────────────────────────────────────────────
+    climb_speed: 1.5
+    escape_step: 3.0          # m gained per escalation
+    trap_confirm_s: 0.6       # a 360-deg trap must persist this long before
+                              # it earns a climb (stops altitude ratcheting)
+    max_escape_altitude: 4.0  # m — PINNED TO cruise_altitude, which disables
+                              # vertical escape entirely. This is not tuning,
+                              # it is the specified envelope, and relaxing it to
+                              # 12 m is what destroyed the 2026-08-27 flight:
+                              # a 2D LiDAR cannot see a horizontal surface it is
+                              # level with, so climbing INTO the roof layer makes
+                              # roofs invisible. The drone drifted to 7.51 m and
+                              # settled dead centre on suburb_roof_3 (top exactly
+                              # 7.50 m), still armed, still in GUIDED, still
+                              # logging "ahead clear", for the rest of the run.
+                              # At 4 m every 7.5 m roof is a WALL — fully visible
+                              # to a horizontal scanner and solvable by steering.
+    # ── Surface contact ───────────────────────────────────────────────────
+    # The catch-all for "I am resting on something". A flying multirotor always
+    # carries some body-rate noise; a landed one carries none, and its measured
+    # ground speed is zero no matter what is commanded. On 2026-08-27 the drone
+    # sat on a rooftop for the remainder of the mission reporting roll -0.08°,
+    # pitch -0.17°, p/q/r all exactly 0.0 °/s and az 9.81 — pure gravity — while
+    # the node cheerfully commanded it forward at cruise speed and printed
+    # "ahead clear". Nothing in the stack noticed. This does.
+    contact_speed: 0.15       # m/s — measured ground speed below which the drone
+                              # is not actually moving
+    contact_confirm_s: 2.0    # s of commanding motion while not moving
+    contact_escape_speed: 1.0 # m/s lateral push used to slide off the surface
+
+    stuck_timeout_s: 15.0     # s without getting CLOSER to the target before
+                              # declaring a local minimum. Measures goal
+                              # progress, not displacement — the drone can
+                              # wander 15 m back and forth along an obstacle
+                              # face while never approaching at all.
+
+    # ── Global route planning: A* over the Nav2 costmap ───────────────────
+    # The layer that actually makes the mission completable. A purely
+    # reactive planner cannot leave a local minimum, and the published work
+    # on this exact stack (360° LiDAR -> VFH -> PX4) says so explicitly:
+    # VFH smooths the local path but "the smoothing effect of the global
+    # flight trajectory is not as expected", with A* named as the fix.
+    # nav2_params.yaml was changed from a 40 m rolling window to a 180 m
+    # global map at the same time — A* over a map that does not contain the
+    # goal is worthless.
+    use_global_planner: true
+    plan_lethal_cost: 90      # 0..100. Deliberately ABOVE blocked_cost (60):
+                              # the inflation layer paints a 2 m gradient
+                              # around every building and a 7 m street is
+                              # nothing but gradient, so treating inflation as
+                              # impassable would close every corridor in the
+                              # map. It is charged as a soft cost instead.
+    plan_downsample: 2        # costmap cells per planning cell -> 1.0 m grid,
+                              # 180x180 = 32k cells. Fine enough to thread a
+                              # 7 m street, small enough that A* finishes in
+                              # milliseconds inside a 20 Hz control loop.
+    plan_carrot_dist: 6.0     # m ahead on the route to steer at. Long enough
+                              # that the drone commits to the corridor, short
+                              # enough that it does not cut corners.
+    replan_period_s: 1.0      # s between replans. The route is topology and
+                              # changes slowly; the 20 Hz reactive layer is
+                              # what handles anything that moves.
+    # These two weights must be read together — they decide whether the drone
+    # prefers a KNOWN street or UNEXPLORED ground, and the first attempt got
+    # it backwards. At 2.0/0.2 a known inflated street cell cost up to
+    # 1 + 2.0*0.89 = 2.78 while unexplored ground cost 1.2, so A* routed the
+    # drone the long way round through territory the LiDAR had never swept
+    # rather than straight down the street it could already see. Every
+    # suburb street here is 7 m wide against a 2 m inflation radius, so a
+    # street is ALL inflation gradient — penalising the gradient heavily
+    # means penalising streets, which is precisely backwards.
+    #
+    # At 0.8/0.6 the ordering is: known-free 1.00 < known-mid-inflation 1.48 <
+    # unknown 1.60 < known-near-lethal 1.71. Open known ground wins, a street
+    # still beats guessing, and only nearly-lethal cells are worse than
+    # unexplored space.
+    plan_cost_penalty: 0.8    # weight on costmap inflation -> prefers the
+                              # middle of a street over scraping the kerb
+    plan_unknown_penalty: 0.6 # prefer ground already swept by the LiDAR,
+                              # without refusing unknown space (at mission
+                              # start almost everything is unknown)
+    plan_max_expansions: 60000
+    # ── Proximity back-off ────────────────────────────────────────────────
+    # The last line of defence, and the only behaviour whose job is simply
+    # not touching anything. Five flights ended with "ahead 0.8m" in the log
+    # and the airframe inverted a second later, under three different states
+    # (TRAPPED 360, TERRAIN-CLIMB, AVOIDING). Each of those reasons about
+    # where to GO; none owns the last metre. This does, and it outranks all
+    # of them.
+    backoff_range: 1.5        # m — inside this, retreat and do nothing else.
+                              # Must exceed self_filter_range (0.7) by a real
+                              # margin or there is no room left to react in.
+    backoff_arc: 80.0         # deg half-arc around the direction of travel.
+                              # Only what we are MOVING TOWARD can be hit.
+                              # Retreating from anything within range in ANY
+                              # direction meant retreating from walls being
+                              # passed abeam: 69 back-offs in 11 minutes and a
+                              # livelock 21-26 m short of WP6.
+    backoff_speed: 0.6        # m/s retreat. Gentle: the point is to open the
+                              # gap without provoking the estimator.
+    detour_max_drift: 8.0     # m further from the target than the detour
+                              # started before it is aborted as a runaway. The
+                              # drone once closed to 16.8 m of WP6 and a
+                              # committed boundary follow walked it back out to
+                              # 44.9 m; a detour that is losing ground is not
+                              # rounding an obstacle, it is fleeing.
+    no_detour_radius: 25.0    # m from the target inside which a stall is
+                              # answered by replanning ONLY. Near the goal a
+                              # detour can only walk away from it, and the
+                              # route is short enough there that a fresh map
+                              # almost always yields one.
+    route_stall_limit: 3      # consecutive route stalls before giving up on
+                              # replanning and falling back to the tangent
+                              # bug. The watchdog must not fight the planner:
+                              # its first response to a stall is a fresh plan,
+                              # not a blind sideways commitment.
+
+    # ── Committed boundary following (tangent bug) ────────────────────────
+    # Once stuck_timeout_s expires and climbing is barred by the 4 m ceiling,
+    # the drone latches a turn direction and follows the obstacle boundary
+    # until it is measurably closer to the target. This is what escapes a
+    # local minimum; a memoryless VFH+ cannot, and a fixed-duration sideways
+    # nudge cannot either — goal attraction simply pulls it back in. On the
+    # WP5->WP6 leg the drone sawtoothed between 31 and 36 m from the waypoint
+    # for minutes on end because the two houses at ENU (10,-15) and (25,-15)
+    # sit across the straight line while WP6 itself is in the street at y=-8.
+    detour_leave_margin: 3.0  # m closer than the entry distance before the
+                              # detour counts as done. Must exceed the
+                              # sawtooth amplitude of the trap (~5 m peak to
+                              # peak here) divided by two, or the detour would
+                              # "succeed" on noise and drop straight back in.
+    detour_timeout_s: 70.0    # s to give one direction before reversing. A
+                              # 9 m building has a ~36 m perimeter; at
+                              # cruise_speed 1.5 m/s that is ~24 s to round,
+                              # so 45 s tries a full circuit plus margin
+                              # before concluding this way is the long way.
+    descend_clear_radius: 3.0 # m — the XY column beneath the drone must be free
+                              # of REMEMBERED obstacles before it may sink. A
+                              # horizontal LiDAR is blind downward and happily
+                              # reports "clear" while hovering over a rooftop;
+                              # descending on that evidence flew the drone into
+                              # a 7.5 m suburb roof at 7.7 m.
+    descend_rate: 0.6         # m/s the target altitude bleeds back toward
+                              # cruise on clear ticks (see node docstring)
+
+    # ── Imminent-collision guard (omnidirectional, velocity aware) ────────
+    # VFH is a static-geometry algorithm: it asks which bearings are free RIGHT
+    # NOW and has no velocity model, so it cannot know a free heading will be
+    # occupied in a second. This guard supplies the missing derivative by
+    # differencing the polar ranges between ticks.
+    #
+    # It triggers on TIME-TO-CONTACT, not raw distance, which is what makes it
+    # usable in tight corridors: a wall the drone flies ALONGSIDE has ~zero
+    # closing speed and infinite TTC however close it is, while anything
+    # genuinely converging is caught from any direction — including the side,
+    # which the old travel-arc check was blind to.
+    evade_distance: 6.0       # m — only consider threats inside this range.
+                              # Needs to be this wide: the moving blocks are 3 m
+                              # across and close at ~5 m/s combined, and the
+                              # persistence filter below adds 0.3 s (~1.5 m) of
+                              # delay. Tightening this to 3 m made the guard see
+                              # them too late and the drone was struck head-on.
+                              # It is affordable ONLY because persistence kills
+                              # the false alarms that this range used to cause.
+    collision_horizon_s: 2.5  # s — evade if impact is predicted sooner.
+                              # Raised from 1.8: earlier warning is the cheapest
+                              # way to react sooner to something that moves.
+    dynamic_closing_thresh: 0.8  # m/s of closing our OWN motion cannot explain.
+                              # A static wall appears to close at exactly our
+                              # speed toward it, so without this the guard fired
+                              # on every wall the drone approached normally —
+                              # 173 false evades vs 12 real steering dodges,
+                              # fighting the VFH steering that already had them
+                              # handled from 10 m out. Only a genuinely MOVING
+                              # obstacle closes faster than our velocity explains.
+    hard_stop_distance: 0.7   # m — fire regardless of the above; true last resort
+    # ── Emergency brake (dynamic obstacles) ───────────────────────────────
+    # The drone BRAKES rather than driving away from a closing obstacle.
+    # Reversing demanded thrust in the opposite direction and, once the guard
+    # was made more sensitive, fired 68 times against 10 genuine steering
+    # decisions in a single flight — straight into "Vibration compensation ON",
+    # "EKF Failsafe: changed to Land Mode", crash-disarm. Commanding zero
+    # horizontal velocity instead lets ArduPilot decelerate smoothly, and a
+    # crossing obstacle is better waited out than outrun.
+    #   BRAKE -> (stopped) ASSESS -> SIDESTEP into a gap, or HOLD -> RESUME
+    brake_hold_s: 1.5         # s to stay stopped after the last detection, so a
+                              # single crossing obstacle cannot cause stop/go
+                              # stuttering
+    brake_stop_speed: 0.25     # m/s below which the drone counts as stopped and
+                              # may start looking for a gap
+    evade_cooldown_s: 0.4     # s minimum between evades. One persistent threat
+                              # used to fire dozens of velocity reversals in a
+                              # burst — 332 evades vs 77 genuine steering
+                              # decisions in a single flight — which is what made
+                              # this guard the leading cause of EKF failsafes.
+
+    # ── Terrain proximity ─────────────────────────────────────────────────
+    # Real obstacles do not surround a drone at ~1 m on every side at once.
+    # That only happens when the beam plane is grazing a surface the drone is
+    # sitting just above. Detected by the COUNT of simultaneously close
+    # sectors, because the roof that killed one run was only ~0.35 m below —
+    # no hit-height threshold can separate that from a wall at flight level.
+    # Response is a pure vertical climb: dashing sideways banks the airframe,
+    # which tips the beam plane deeper into the surface and makes it worse.
+    terrain_close_range: 2.0     # m
+    terrain_close_sectors: 12    # of 72 sectors inside that range
+    terrain_below_margin: 0.2    # m the hit must sit BELOW the drone to count as
+                                 # ground. Sector count alone cannot tell a roof
+                                 # underneath from a narrow canyon between two
+                                 # towers — both surround you. Height can: a
+                                 # surface below produces hits under the drone,
+                                 # canyon walls sit at its own level. Without
+                                 # this the drone froze 23 m up in an 8 m
+                                 # skyscraper gap, climbing over a nonexistent roof.
+    threat_persist_ticks: 2   # Lowered from 3. Still rejects binning noise
+                              # (uncorrelated tick-to-tick) but cuts 100 ms off
+                              # confirmation — at 10 Hz that is real distance.
+                              # Original note: the SAME sector must look dangerous this many
+                              # consecutive ticks. `nearest` is a min-per-bin
+                              # statistic over a rotating sensor, so it jumps
+                              # metres from binning noise alone; differencing
+                              # it manufactured 1002 false evades in one run.
+                              # Noise is uncorrelated tick-to-tick; a real
+                              # converging obstacle persists trivially.
+
+    # ── Smart retrace ─────────────────────────────────────────────────────
+    enable_retrace: true
+    breadcrumb_spacing: 4.0   # m between proven-clear trail points
+    retrace_lookahead: 8.0    # m — chase a breadcrumb at least this far away,
+                              # skipping nearer ones (pure-pursuit style).
+                              # Breadcrumbs sit 4 m apart while wp_radius is 3 m,
+                              # so steering at "the next one" left the drone
+                              # permanently arriving: 62 targets became 62 jerky
+                              # hops with the bearing swinging every step. Every
+                              # abort clustered in the retrace; the outbound legs
+                              # always completed.

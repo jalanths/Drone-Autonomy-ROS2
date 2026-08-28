@@ -1,0 +1,23 @@
+# colcon build products
+build/
+install/
+log/
+
+# runtime logs written by scripts/run_mission.sh (includes SITL eeprom.bin)
+.run_logs/
+
+__pycache__/
+*.pyc
+
+# SITL runtime artifacts (regenerated every run)
+mav.tlog
+mav.tlog.raw
+mav.parm
+eeprom.bin
+
+# Screen recordings — 740 MB of mp4 does not belong in git history
+*.mp4
+*.webm
+
+# LibreOffice lock files
+.~lock.*#

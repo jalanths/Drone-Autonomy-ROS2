@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
 """
-Nav2 Obstacle-Aware Navigation Node (Version 2.0)
-=================================================
-This node subscribes to the 2D Costmap published by Nav2, rather than raw Lidar data.
-By using the Costmap, we see "inflated" obstacles, ensuring the drone never clips
-a wall with its propellers.
+Autonomous Random Explorer with Obstacle Avoidance (V3.0)
+=========================================================
+The drone takes off to 4m, then randomly explores the entire Gazebo world
+forever. It picks a random GPS target within ~80m, flies towards it, and
+when the Nav2 Costmap detects an obstacle ahead it autonomously dodges
+left/right/back/up. Once the path is clear, it picks a NEW random target
+and keeps exploring. It never stops — Ctrl+C to land.
 
-It searches the Costmap grid ahead of the drone. If the cost is too high (fatal obstacle),
-it stops and dodges laterally to an area with lower cost.
+Algorithm:
+  1. Take off to 4m
+  2. Pick a random GPS target within EXPLORE_RADIUS
+  3. Fly toward target
+  4. If obstacle detected in costmap → DODGE (left/right/back/up)
+  5. After dodge or target reached → pick new random target → goto 3
 """
 
 import rclpy
@@ -17,11 +23,11 @@ from mavros_msgs.msg import State
 from mavros_msgs.srv import CommandBool, SetMode, CommandTOL
 from geographic_msgs.msg import GeoPoseStamped
 from geometry_msgs.msg import Twist
-
 from sensor_msgs.msg import NavSatFix
 from nav_msgs.msg import OccupancyGrid
 import math
 import time
+import random
 import numpy as np
 
 
@@ -34,39 +40,43 @@ class Nav2ObstacleNode(Node):
         self.current_lat = 0.0
         self.current_lon = 0.0
         self.current_alt = 0.0
+        self.home_lat = 0.0
+        self.home_lon = 0.0
+        self.home_alt = 0.0
         self.gps_received = False
         self.costmap_received = False
 
         # Costmap grid and metadata
         self.costmap = None
         self.map_resolution = 0.1
-        self.map_origin_x = 0.0
-        self.map_origin_y = 0.0
 
-        # Nav points
-        self.waypoints = [
-            (-35.36280, 149.16530, 599.0),  # WP1
-            (-35.36350, 149.16600, 599.0),  # WP2
-            (-35.36380, 149.16450, 599.0),  # WP3
-            (-35.36320, 149.16400, 599.0),  # WP4
-            (-35.36250, 149.16500, 599.0),  # WP5
-            (-35.36300, 149.16550, 599.0),  # WP6
-        ]
-        self.current_wp_index = 0
-        self.wp_reached_threshold = 6.0
-
-        self.breadcrumbs = []
-        self.last_breadcrumb = None
-        self.is_retracing = False
-
+        # ── Explorer Config ──────────────────────────────────────
         self.phase = 'CONNECTING'
-        self.takeoff_alt = 15.0
+        self.takeoff_alt = 4.0
         self.takeoff_time = None
-        
+        self.cruise_alt = 0.0  # Set from home_alt + takeoff_alt after GPS fix
+
+        # Random exploration parameters
+        self.EXPLORE_RADIUS = 80.0       # meters: max distance for random target
+        self.EXPLORE_MIN_RADIUS = 20.0   # meters: min distance for random target
+        self.target_lat = 0.0
+        self.target_lon = 0.0
+        self.target_reached_threshold = 8.0  # meters
+        self.targets_visited = 0
+        self.explore_start_time = None
+
         # Avoidance State
-        self.danger_cell_cost = 90  # 0-100 (100 = solid wall, >90 = inflated wall)
-        self.dodge_speed = 2.0
-        self.avoidance_state = 'CLEAR'
+        self.danger_cell_cost = 90
+        self.dodge_speed = 2.5
+        self.is_dodging = False
+        self.dodge_start_time = None
+        self.DODGE_DURATION = 2.0  # seconds to dodge before re-evaluating
+        self.consecutive_dodges = 0
+
+        # Stats
+        self.total_distance = 0.0
+        self.last_stat_lat = None
+        self.last_stat_lon = None
 
         # ── ROS 2 Setup ──────────────────────────────────────────
         sensor_qos = QoSProfile(
@@ -74,7 +84,6 @@ class Nav2ObstacleNode(Node):
             durability=DurabilityPolicy.VOLATILE,
             depth=10
         )
-        # Nav2 costmap publishes with TRANSIENT_LOCAL + RELIABLE
         map_qos = QoSProfile(
             depth=1,
             reliability=ReliabilityPolicy.RELIABLE,
@@ -95,92 +104,112 @@ class Nav2ObstacleNode(Node):
         self.timer = self.create_timer(0.25, self.main_loop)
 
         self.get_logger().info('═══════════════════════════════════════════')
-        self.get_logger().info('  🗺️  Nav2 Costmap Node Started (V2.0)')
+        self.get_logger().info('  🌍 Autonomous Random Explorer V3.0')
+        self.get_logger().info('  🔭 Mode: Infinite Random Exploration')
+        self.get_logger().info('  📏 Altitude: 4m  |  Radius: 80m')
+        self.get_logger().info('  🛡️ Obstacle Avoidance: Nav2 Costmap')
         self.get_logger().info('═══════════════════════════════════════════')
 
-    def state_cb(self, msg): self.current_state = msg
-    
+    # ══════════════════════════════════════════════════════════════
+    #  Callbacks
+    # ══════════════════════════════════════════════════════════════
+
+    def state_cb(self, msg):
+        self.current_state = msg
+
     def gps_cb(self, msg):
         self.current_lat = msg.latitude
         self.current_lon = msg.longitude
         self.current_alt = msg.altitude
-        self.gps_received = True
+        if not self.gps_received:
+            self.gps_received = True
+            self.home_lat = msg.latitude
+            self.home_lon = msg.longitude
+            self.home_alt = msg.altitude
+            self.cruise_alt = self.home_alt + self.takeoff_alt
+            self.get_logger().info(f'📡 GPS Fix: {msg.latitude:.6f}, {msg.longitude:.6f}, Alt: {msg.altitude:.1f}m AMSL')
+            self.get_logger().info(f'📏 Home Alt: {self.home_alt:.1f}m | Cruise Alt: {self.cruise_alt:.1f}m (home + {self.takeoff_alt}m)')
 
     def costmap_cb(self, msg: OccupancyGrid):
         if not self.costmap_received:
             self.get_logger().info('🗺️ Nav2 Costmap Received!')
             self.costmap_received = True
-            
         self.map_resolution = msg.info.resolution
         self.costmap = np.array(msg.data, dtype=np.int8).reshape(msg.info.height, msg.info.width)
 
-    def scan_costmap_sectors(self):
-        """
-        Analyzes the 2D Costmap matrix directly in front, left, and right of the drone.
-        The local costmap is centered around the drone.
-        """
-        if self.costmap is None:
-            return 0, 0, 0
+    # ══════════════════════════════════════════════════════════════
+    #  Random Target Generator
+    # ══════════════════════════════════════════════════════════════
 
-        # costmap is a 2D numpy array [y, x] where the drone is perfectly in the center.
-        # Cost is 0-100. -1 is unknown.
+    def pick_random_target(self):
+        """Pick a random GPS coordinate within EXPLORE_RADIUS of home."""
+        angle = random.uniform(0, 2 * math.pi)
+        dist = random.uniform(self.EXPLORE_MIN_RADIUS, self.EXPLORE_RADIUS)
+
+        # Convert meters to lat/lon offset
+        dlat = (dist * math.cos(angle)) / 111111.0
+        dlon = (dist * math.sin(angle)) / (111111.0 * math.cos(math.radians(self.home_lat)))
+
+        self.target_lat = self.home_lat + dlat
+        self.target_lon = self.home_lon + dlon
+
+        bearing_deg = math.degrees(angle) % 360
+        compass = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'][int(bearing_deg / 45) % 8]
+
+        self.get_logger().info(
+            f'🎯 NEW TARGET #{self.targets_visited + 1}: '
+            f'{dist:.0f}m {compass} (bearing {bearing_deg:.0f}°) | '
+            f'GPS: ({self.target_lat:.6f}, {self.target_lon:.6f})')
+
+    # ══════════════════════════════════════════════════════════════
+    #  Costmap Obstacle Scanner
+    # ══════════════════════════════════════════════════════════════
+
+    def scan_costmap_sectors(self):
+        """Scan front/left/right/back sectors of the local costmap."""
+        if self.costmap is None:
+            return 0, 0, 0, 0
+
         height, width = self.costmap.shape
         cy, cx = height // 2, width // 2
-        
-        # Check a 2-meter grid (20 cells at 0.1m resolution) directly ahead (x direction)
-        search_radius = 20
-        # Use a 6-cell gap (±0.6m) to represent exactly the physical width of the drone corridor
-        gap = 6
-        
+
+        search_radius = 80  # 8m lookahead at 0.1m resolution
+        gap = 10  # ±1.0m corridor width
+
         front_cells = self.costmap[cy - gap: cy + gap, cx: cx + search_radius]
-        left_cells  = self.costmap[cy + gap: cy + search_radius, cx: cx + search_radius]
-        right_cells = self.costmap[cy - search_radius: cy - gap, cx: cx + search_radius]
-        
+        left_cells  = self.costmap[cy + gap: cy + search_radius, cx - search_radius: cx + search_radius]
+        right_cells = self.costmap[cy - search_radius: cy - gap, cx - search_radius: cx + search_radius]
+        back_cells  = self.costmap[cy - gap: cy + gap, cx - search_radius: cx]
+
         def max_cost(cells):
-            return np.max(cells) if cells.size > 0 else 0
+            return int(np.max(cells)) if cells.size > 0 else 0
 
-        f, l, r = max_cost(front_cells), max_cost(left_cells), max_cost(right_cells)
-        
-        # Diagnostic: print quadrant maximums when obstacle detected
-        if f > 0 or l > 0 or r > 0:
-            # Find where the max cost cells actually are
-            front_half = np.max(self.costmap[:, cx:]) if self.costmap[:, cx:].size > 0 else 0
-            back_half = np.max(self.costmap[:, :cx]) if self.costmap[:, :cx].size > 0 else 0
-            top_half = np.max(self.costmap[cy:, :]) if self.costmap[cy:, :].size > 0 else 0
-            bot_half = np.max(self.costmap[:cy, :]) if self.costmap[:cy, :].size > 0 else 0
-            
-            # Find actual location of max cost cell
-            max_idx = np.unravel_index(np.argmax(self.costmap), self.costmap.shape)
-            rel_x = (max_idx[1] - cx) * self.map_resolution
-            rel_y = (max_idx[0] - cy) * self.map_resolution
-            
-            if not hasattr(self, '_diag_count'):
-                self._diag_count = 0
-            self._diag_count += 1
-            if self._diag_count % 20 == 1:
-                self.get_logger().warn(
-                    f'📊 DIAG: Shape={self.costmap.shape} '
-                    f'FrontHalf={front_half} BackHalf={back_half} '
-                    f'TopHalf={top_half} BotHalf={bot_half} '
-                    f'MaxAt=({rel_x:.1f}m, {rel_y:.1f}m)'
-                )
+        return max_cost(front_cells), max_cost(left_cells), max_cost(right_cells), max_cost(back_cells)
 
-        return f, l, r
+    # ══════════════════════════════════════════════════════════════
+    #  Main Loop — State Machine
+    # ══════════════════════════════════════════════════════════════
 
     def main_loop(self):
         if not self.gps_received or not self.costmap_received:
-            return  # Wait for sensors
+            return
 
+        # ── Startup Phases ────────────────────────────────────────
         if self.phase == 'CONNECTING':
-            if self.current_state.connected: self.phase = 'SET_MODE'
+            if self.current_state.connected:
+                self.phase = 'SET_MODE'
             return
         if self.phase == 'SET_MODE':
-            if self.current_state.mode == 'GUIDED': self.phase = 'ARMING'
-            else: self.set_mode('GUIDED')
+            if self.current_state.mode == 'GUIDED':
+                self.phase = 'ARMING'
+            else:
+                self.set_mode('GUIDED')
             return
         if self.phase == 'ARMING':
-            if self.current_state.armed: self.phase = 'TAKEOFF'
-            else: self.arm_drone()
+            if self.current_state.armed:
+                self.phase = 'TAKEOFF'
+            else:
+                self.arm_drone()
             return
         if self.phase == 'TAKEOFF':
             self.takeoff(self.takeoff_alt)
@@ -188,70 +217,99 @@ class Nav2ObstacleNode(Node):
             self.phase = 'ASCENDING'
             return
         if self.phase == 'ASCENDING':
-            if time.time() - self.takeoff_time > 12.0:
-                self.phase = 'NAVIGATE'
+            if time.time() - self.takeoff_time > 10.0:
+                # cruise_alt already set from home_alt + takeoff_alt in gps_cb
+                self.explore_start_time = time.time()
+                self.pick_random_target()
+                self.phase = 'EXPLORE'
+                self.get_logger().info(f'🚀 EXPLORATION STARTED! Cruise alt: {self.cruise_alt:.1f}m AMSL')
             return
 
-        if self.phase == 'NAVIGATE':
-            # Are we done?
-            if self.current_wp_index >= len(self.waypoints):
-                if not self.is_retracing:
-                    self.get_logger().info(f'✅ PATROL COMPLETE! Retracing {len(self.breadcrumbs)} breadcrumbs back to home...')
-                    self.waypoints = list(reversed(self.breadcrumbs))
-                    self.current_wp_index = 0
-                    self.is_retracing = True
-                    return
-                else:
-                    self.get_logger().info('✅ RETRACE COMPLETE! Triggering final landing (RTL).')
-                    self.set_mode('RTL')
-                    self.phase = 'RTL'
-                    return
+        # ── EXPLORE: The main autonomous exploration loop ─────────
+        if self.phase == 'EXPLORE':
+            # Track distance traveled
+            if self.last_stat_lat is not None:
+                d = self.haversine(self.current_lat, self.current_lon, self.last_stat_lat, self.last_stat_lon)
+                if d > 1.0:
+                    self.total_distance += d
+                    self.last_stat_lat = self.current_lat
+                    self.last_stat_lon = self.current_lon
+            else:
+                self.last_stat_lat = self.current_lat
+                self.last_stat_lon = self.current_lon
 
-            # Record breadcrumb every 30 meters of travel (only during outbound patrol)
-            if not self.is_retracing:
-                if self.last_breadcrumb is None or self.haversine(self.current_lat, self.current_lon, self.last_breadcrumb[0], self.last_breadcrumb[1]) > 30.0:
-                    # Use AMSL altitude (same as waypoints), NOT relative takeoff_alt!
-                    cruise_alt = self.waypoints[0][2]  # 599.0 AMSL
-                    self.breadcrumbs.append((self.current_lat, self.current_lon, cruise_alt))
-                    self.last_breadcrumb = (self.current_lat, self.current_lon)
-
-            target_lat, target_lon, target_alt = self.waypoints[self.current_wp_index]
-            dist = self.haversine(self.current_lat, self.current_lon, target_lat, target_lon)
-
-            # Use wider acceptance radius during retrace (ArduPilot brakes early on short hops)
-            threshold = 15.0 if self.is_retracing else self.wp_reached_threshold
-            if dist < threshold:
-                self.get_logger().info(f'📍 Waypoint {self.current_wp_index + 1} REACHED!')
-                self.current_wp_index += 1
+            # Check if current target reached
+            dist_to_target = self.haversine(self.current_lat, self.current_lon, self.target_lat, self.target_lon)
+            if dist_to_target < self.target_reached_threshold:
+                self.targets_visited += 1
+                elapsed = time.time() - self.explore_start_time
+                self.get_logger().info(
+                    f'📍 TARGET #{self.targets_visited} REACHED! '
+                    f'[Total: {self.total_distance:.0f}m flown in {elapsed:.0f}s] '
+                    f'Picking new random target...')
+                self.consecutive_dodges = 0
+                self.pick_random_target()
                 return
 
-            # Nav2 Costmap Avoidance Logic
-            front_cost, left_cost, right_cost = self.scan_costmap_sectors()
+            # ── Obstacle Avoidance ────────────────────────────────
+            front_cost, left_cost, right_cost, back_cost = self.scan_costmap_sectors()
 
             if front_cost > self.danger_cell_cost:
-                self.was_dodging = True
-                self.get_logger().warn(f'🚨 INFLATED WALL DETECTED AHEAD (Cost {front_cost}/100)! DODGING!')
-                
-                # Check if trapped!
-                if left_cost >= self.danger_cell_cost and right_cost >= self.danger_cell_cost:
-                    self.get_logger().warn(f'  ⬇️ Trapped! Dodging BACKWARDS (L:{left_cost} R:{right_cost})')
-                    self.send_velocity(-self.dodge_speed, 0.0, 0.0)
-                # Dodge to the side with lower cost
-                elif left_cost < right_cost:
-                    self.get_logger().info(f'  ↰ Dodging LEFT (L-Cost:{left_cost}  R-Cost:{right_cost})')
-                    self.send_velocity(0.0, self.dodge_speed, 0.0)
-                else:
-                    self.get_logger().info(f'  ↱ Dodging RIGHT (R-Cost:{right_cost}  L-Cost:{left_cost})')
-                    self.send_velocity(0.0, -self.dodge_speed, 0.0)
-            else:
-                if int(time.time()) % 3 == 0:
-                    global_max = np.max(self.costmap) if self.costmap is not None else 0
-                    self.get_logger().info(f'✅ Path clear. (MapMax:{global_max} F:{front_cost} L:{left_cost} R:{right_cost}) Navigatng to WP {self.current_wp_index + 1}. Dist: {int(dist)}m')
-                    
-                # Send GPS position target — ArduPilot handles the flight
-                self.publish_global_setpoint(target_lat, target_lon, target_alt)
+                self.is_dodging = True
+                self.dodge_start_time = time.time()
+                self.consecutive_dodges += 1
 
-    # ── Helpers ───────────────────────────────────────────────────
+                self.get_logger().warn(
+                    f'🚨 OBSTACLE AHEAD! (F:{front_cost} L:{left_cost} R:{right_cost} B:{back_cost}) '
+                    f'Dodge #{self.consecutive_dodges}')
+
+                # If stuck after many consecutive dodges, pick a completely new target
+                if self.consecutive_dodges > 8:
+                    self.get_logger().warn('🔄 TOO MANY DODGES! Picking completely new random target...')
+                    self.consecutive_dodges = 0
+                    self.pick_random_target()
+                    return
+
+                # Dodge logic: escape to the safest direction
+                if left_cost >= self.danger_cell_cost and right_cost >= self.danger_cell_cost:
+                    if back_cost >= self.danger_cell_cost:
+                        self.get_logger().warn('  🆘 TRAPPED 360°! Escaping UPWARD!')
+                        self.send_velocity(0.0, 0.0, 1.0)
+                    else:
+                        self.get_logger().warn('  ⬅️ Front+Sides blocked! Reversing...')
+                        self.send_velocity(-self.dodge_speed, 0.0, 0.0)
+                elif left_cost < right_cost:
+                    self.get_logger().info(f'  ↰ Dodging LEFT (L:{left_cost} < R:{right_cost})')
+                    self.send_velocity(0.5, self.dodge_speed, 0.0)
+                else:
+                    self.get_logger().info(f'  ↱ Dodging RIGHT (R:{right_cost} < L:{left_cost})')
+                    self.send_velocity(0.5, -self.dodge_speed, 0.0)
+
+            else:
+                # Path is clear — fly toward random target
+                if self.is_dodging:
+                    self.is_dodging = False
+                    self.get_logger().info('✅ Path CLEAR after dodge! Resuming exploration.')
+
+                if self.consecutive_dodges > 0 and not self.is_dodging:
+                    self.consecutive_dodges = max(0, self.consecutive_dodges - 1)
+
+                # Print status every ~3 seconds
+                if int(time.time()) % 3 == 0:
+                    home_dist = self.haversine(self.current_lat, self.current_lon, self.home_lat, self.home_lon)
+                    global_max = int(np.max(self.costmap)) if self.costmap is not None else 0
+                    self.get_logger().info(
+                        f'🔭 EXPLORING → Target #{self.targets_visited + 1} | '
+                        f'Dist: {dist_to_target:.0f}m | '
+                        f'FromHome: {home_dist:.0f}m | '
+                        f'MapMax: {global_max} | '
+                        f'Total: {self.total_distance:.0f}m flown')
+
+                self.publish_global_setpoint(self.target_lat, self.target_lon, self.cruise_alt)
+
+    # ══════════════════════════════════════════════════════════════
+    #  Helpers
+    # ══════════════════════════════════════════════════════════════
 
     def send_velocity(self, vx, vy, vz):
         msg = Twist()
@@ -264,7 +322,9 @@ class Nav2ObstacleNode(Node):
         msg = GeoPoseStamped()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = 'map'
-        msg.pose.position.latitude, msg.pose.position.longitude, msg.pose.position.altitude = lat, lon, alt
+        msg.pose.position.latitude = lat
+        msg.pose.position.longitude = lon
+        msg.pose.position.altitude = alt
         msg.pose.orientation.w = 1.0
         self.global_setpoint_pub.publish(msg)
 
@@ -274,13 +334,13 @@ class Nav2ObstacleNode(Node):
         phi1, phi2 = math.radians(lat1), math.radians(lat2)
         dphi = math.radians(lat2 - lat1)
         dlambda = math.radians(lon2 - lon1)
-        a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlambda/2)**2
+        a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
         return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
     def set_mode(self, mode):
         req = SetMode.Request(custom_mode=mode)
         self.set_mode_client.call_async(req)
-        
+
     def arm_drone(self):
         req = CommandBool.Request(value=True)
         self.arming_client.call_async(req)
@@ -293,14 +353,15 @@ class Nav2ObstacleNode(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = Nav2ObstacleNode()
-    try: 
+    try:
         rclpy.spin(node)
-    except KeyboardInterrupt: 
+    except KeyboardInterrupt:
         pass
     finally:
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
+
 
 if __name__ == '__main__':
     main()

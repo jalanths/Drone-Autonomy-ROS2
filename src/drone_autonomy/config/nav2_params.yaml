@@ -1,33 +1,133 @@
-/**:
-  ros__parameters:
-    global_frame: 'base_link'
-    robot_base_frame: 'base_link'
-    update_frequency: 5.0
-    publish_frequency: 2.0
-    use_sim_time: False
-    rolling_window: True
-    width: 10
-    height: 10
-    resolution: 0.1
-    robot_radius: 0.45
-    always_send_full_costmap: True
-    plugins: ["obstacle_layer", "inflation_layer"]
-    obstacle_layer:
-      plugin: "nav2_costmap_2d::ObstacleLayer"
-      enabled: True
-      observation_sources: scan
-      scan:
-        topic: /scan
-        min_obstacle_height: -20.0
-        max_obstacle_height: 20.0
-        clearing: True
-        marking: True
-        data_type: "LaserScan"
-        raytrace_max_range: 12.0
-        raytrace_min_range: 0.15
-        obstacle_max_range: 12.0
-        obstacle_min_range: 0.15
-    inflation_layer:
-      plugin: "nav2_costmap_2d::InflationLayer"
-      cost_scaling_factor: 3.0
-      inflation_radius: 0.5
+# ══════════════════════════════════════════════════════════════════════
+#  Nav2 Costmap configuration for an AERIAL platform (Tarot 650 / Iris)
+# ══════════════════════════════════════════════════════════════════════
+#
+#  IMPORTANT — the node's fully-qualified name
+#  -------------------------------------------
+#  The standalone `nav2_costmap_2d` executable constructs
+#  Costmap2DROS("costmap"), and that constructor places the lifecycle node in
+#  a namespace equal to its own name. The result, verified with
+#  `ros2 node list`, is:
+#
+#        /costmap/costmap        (namespace /costmap, node name costmap)
+#
+#  so the parameter key has to be NESTED as `costmap: costmap:` — exactly the
+#  shape nav2_bringup uses for `local_costmap: local_costmap:`. A single-level
+#  `costmap:` key matches nothing and every parameter below is silently
+#  dropped. For the same reason the lifecycle manager in autonomy_launch.py
+#  must manage 'costmap/costmap', not 'costmap'.
+#
+#  HISTORICAL BUG (fixed here)
+#  ---------------------------
+#  The previous version of this file indented `global_frame` at the SAME
+#  level as `ros__parameters`, making every setting a *sibling* of
+#  ros__parameters instead of a child. `ros__parameters` parsed as None,
+#  so the costmap ran on stock defaults — including
+#  max_obstacle_height = 2.0 m. Because this drone's laser sits at ~4.25 m
+#  in the `odom` frame, 100% of laser returns were height-filtered and the
+#  costmap was ALWAYS EMPTY. Obstacle avoidance could never trigger.
+#
+#  AERIAL-SPECIFIC TUNING
+#  ----------------------
+#  A ground robot filters obstacles by height to ignore the floor/ceiling.
+#  A drone changes altitude constantly, so its horizontal 2D laser returns
+#  land at whatever z the drone happens to be flying at. Height filtering
+#  is therefore actively harmful here: the bounds are opened wide so that
+#  a return is accepted no matter what altitude we are cruising at.
+# ══════════════════════════════════════════════════════════════════════
+
+costmap:
+  costmap:
+    ros__parameters:
+      use_sim_time: true
+
+      # ── Frames ────────────────────────────────────────────────────────
+      # odom <- published by odom_tf_broadcaster from /mavros/local_position/pose
+      # base_link <- the drone body; laser_link hangs off it via static TF
+      global_frame: odom
+      robot_base_frame: base_link
+      transform_tolerance: 0.5
+
+      # ── GLOBAL map, not a rolling window ──────────────────────────────
+      # This was `rolling_window: true` with a 40 m box, i.e. a 20 m radius
+      # centred on the drone. That is enough for reactive steering and
+      # USELESS for route finding: on the WP5->WP6 leg the drone sat 33 m
+      # from the waypoint, so the target was outside the map entirely and
+      # nothing in the stack could see that the way through was the street
+      # to the north. A local planner with a local map cannot do anything
+      # but fall into local minima.
+      #
+      # The mission spans ENU x -60..32, y -50..60 (six waypoints plus the
+      # takeoff point at the origin), so a 180 m box with the origin at
+      # (-90, -85) covers all of it with room to spare.
+      #
+      # Resolution drops 0.1 -> 0.5 m to keep the grid at 360x360 = 130k
+      # cells. That is deliberate and safe: the costmap is NOT what avoids
+      # obstacles here — build_histogram() steers off the raw LaserScan, and
+      # the map is used only for route planning, obstacle MEMORY and the
+      # descend check. Half-metre cells under a 2.0 m inflation radius are
+      # ample for all three, and a 0.1 m global map would have been 3.2M
+      # cells republished in full several times a second.
+      rolling_window: false
+      width: 180
+      height: 180
+      resolution: 0.5
+      origin_x: -90.0
+      origin_y: -85.0
+
+      update_frequency: 10.0
+      # The full grid is republished every cycle (the planner needs the whole
+      # map, not incremental update patches), so this is deliberately slower
+      # than the update rate. 130k cells at 2 Hz is cheap; at 5 Hz it is not.
+      publish_frequency: 2.0
+      always_send_full_costmap: true
+
+      # ── Footprint ─────────────────────────────────────────────────────
+      # Iris is ~0.47 m motor-to-motor; 0.6 m adds propeller + pose margin.
+      robot_radius: 0.6
+
+      plugins: ["obstacle_layer", "inflation_layer"]
+
+      obstacle_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: true
+        observation_sources: scan
+        # Only keep the most recent scan so that MOVING obstacles are cleared
+        # as soon as they leave the beam. Any persistence smears dynamic
+        # obstacles into permanent walls.
+        observation_persistence: 0.0
+        combination_method: 1
+        scan:
+          topic: /scan
+          # sensor_frame is deliberately left unset so nav2 uses the frame_id
+          # carried on the message itself. Gazebo Classic PREFIXES the model
+          # name onto the sensor frame, so /scan actually arrives stamped
+          # `iris_demo::laser_link`, NOT the `laser_link` written in the SDF's
+          # <frame_name>. Hardcoding `laser_link` here silently mismatches and
+          # every observation is dropped. autonomy_launch.py publishes a static
+          # TF for both spellings.
+          data_type: "LaserScan"
+          marking: true
+          clearing: true
+          # See header: never filter an aerial laser by height.
+          min_obstacle_height: -100.0
+          max_obstacle_height: 100.0
+          # Previous config ignored everything closer than 2.0 m — on a drone
+          # that is precisely the range you must not be blind in.
+          # 0.8 m, not 0.4: the spinning propellers return ~0.3 m hits in a
+          # fixed body-frame arc, which would otherwise be marked as a real
+          # obstacle permanently glued to the drone.
+          obstacle_min_range: 0.8
+          obstacle_max_range: 25.0
+          raytrace_min_range: 0.8
+          raytrace_max_range: 30.0
+          inf_is_valid: false
+          expected_update_rate: 0.0
+
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        enabled: true
+        # 2.0 m keeps the drone a full rotor-span clear of concrete.
+        inflation_radius: 2.0
+        cost_scaling_factor: 3.0
+        inflate_unknown: false

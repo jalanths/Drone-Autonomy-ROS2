@@ -44,9 +44,13 @@ class WaypointNavNode(Node):
         # Each waypoint is roughly 50 meters apart.
         # Format: (latitude, longitude, altitude_amsl)
         self.waypoints = [
-            (-35.36280, 149.16530, 599.0),  # WP1: ~50m North
-            (-35.36350, 149.16600, 599.0),  # WP2: ~50m East
-            (-35.36380, 149.16450, 599.0),  # WP3: ~50m West
+            (-35.363532, 149.164906, 589.0),  # WP1 (Suburbs)
+            (-35.362812, 149.165789, 589.0),  # WP2 (Downtown)
+            (-35.362812, 149.164685, 589.0),  # WP3 (Industrial)
+            (-35.363262, 149.165789, 589.0),  # WP4 (Approach Bridge)
+            (-35.363262, 149.166230, 589.0),  # WP5 (Under Bridge)
+            (-35.363712, 149.165678, 589.0),  # WP6 (Park Forest)
+            (-35.363262, 149.165237, 589.0),  # WP7 (Home)
         ]
         self.current_wp_index = 0
         self.wp_reached_threshold = 2.0  # meters - how close is "arrived"
@@ -89,7 +93,7 @@ class WaypointNavNode(Node):
         # Phases: CONNECTING -> SET_MODE -> ARMING -> TAKEOFF ->
         #         ASCENDING -> NAVIGATE -> RTL -> DONE
 
-        self.takeoff_alt = 15.0
+        self.takeoff_alt = 5.0
         self.takeoff_time = None
 
         # ── Main timer: runs every 0.5 seconds ───────────────────

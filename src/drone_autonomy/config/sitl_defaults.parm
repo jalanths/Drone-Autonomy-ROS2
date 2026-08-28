@@ -1,0 +1,64 @@
+# ══════════════════════════════════════════════════════════════════════════
+#  ArduCopter SITL defaults for the autonomous mission
+#  Loaded via:  arducopter --defaults copter.parm,gazebo-iris.parm,sitl_defaults.parm
+# ══════════════════════════════════════════════════════════════════════════
+#
+#  WHY THE SR0_* BLOCK IS ESSENTIAL
+#  --------------------------------
+#  ArduPilot streams NOTHING except HEARTBEAT until a GCS asks for more, using
+#  either REQUEST_DATA_STREAM or the SR<n>_* stream-rate parameters. MAVProxy
+#  issues those requests automatically, which is why the problem is invisible
+#  when you launch through sim_vehicle.py — but MAVROS 2 does not request
+#  streams from ArduPilot, so connecting it straight to SITL yields:
+#
+#      /mavros/state                    1 Hz   (HEARTBEAT only)
+#      /mavros/local_position/pose      SILENT
+#      /mavros/global_position/global   SILENT
+#      /mavros/imu/data                 SILENT
+#
+#  A silent /mavros/local_position/pose is fatal here: it is the source for
+#  the odom -> base_link transform, without which Nav2 discards every laser
+#  return and the costmap stays empty. The symptom looks like a broken
+#  costmap; the cause is an unrequested MAVLink stream.
+#
+#  SERIAL0 is the TCP 5760 port MAVROS attaches to, hence SR0_*.
+#  Rates are in Hz.
+
+SR0_EXT_STAT     5     # SYS_STATUS, GPS_RAW_INT, EKF_STATUS_REPORT
+SR0_EXTRA1      10     # ATTITUDE
+SR0_EXTRA2      10     # VFR_HUD
+SR0_EXTRA3       5     # AHRS, SYSTEM_TIME, TERRAIN
+SR0_POSITION    20     # LOCAL_POSITION_NED + GLOBAL_POSITION_INT  <-- critical
+SR0_RAW_SENS     5     # RAW_IMU, SCALED_PRESSURE
+SR0_RC_CHAN      5     # RC_CHANNELS, SERVO_OUTPUT_RAW
+SR0_PARAMS      10
+
+# Mirror onto SERIAL1/2 so a MAVProxy or QGC session attached alongside
+# (udp 14550 / tcp 5763) sees the same telemetry.
+SR1_EXT_STAT     5
+SR1_EXTRA1      10
+SR1_EXTRA2      10
+SR1_EXTRA3       5
+SR1_POSITION    20
+SR1_RAW_SENS     5
+SR1_RC_CHAN      5
+
+# ── Guided-mode behaviour ────────────────────────────────────────────────
+# The mission node streams velocity setpoints at 10 Hz. This is how long
+# ArduPilot will coast on the last command before deciding the offboard link
+# is dead; 3 s comfortably absorbs a scheduling hiccup without letting a
+# genuinely crashed node fly the drone away.
+GUID_TIMEOUT     3.0
+
+# Let GUIDED accept the velocity magnitudes the avoidance logic commands.
+WPNAV_SPEED    500     # cm/s horizontal
+WPNAV_SPEED_UP 250     # cm/s climb  — matters for the 360-degree trap escape
+WPNAV_SPEED_DN 150     # cm/s descent
+WPNAV_ACCEL    250     # cm/s/s
+
+# ── Simulation conveniences ──────────────────────────────────────────────
+SIM_GPS1_DISABLE 0
+SIM_SPEEDUP      1
+# No wind: keeps avoidance runs repeatable. Raise to stress-test the
+# controller against disturbance.
+SIM_WIND_SPD     0

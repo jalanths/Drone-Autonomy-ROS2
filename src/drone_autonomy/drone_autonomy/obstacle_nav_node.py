@@ -91,7 +91,7 @@ class ObstacleNavNode(Node):
         # State machine
         self.phase = 'CONNECTING'
         self.avoidance_state = 'CLEAR'  # CLEAR, WARNING, DODGING
-        self.takeoff_alt = 15.0
+        self.takeoff_alt = 5.0
         self.takeoff_time = None
 
         # ══════════════════════════════════════════════════════════

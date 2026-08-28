@@ -1,0 +1,63 @@
+# ══════════════════════════════════════════════════════════════════════════
+#  MAVROS plugin allowlist  (ArduPilot / ArduCopter)
+# ══════════════════════════════════════════════════════════════════════════
+#
+#  WHY THIS FILE EXISTS — stock mavros_node ABORTS on startup
+#  ----------------------------------------------------------
+#  In this MAVROS build the per-plugin topic sub-namespacing is broken:
+#  plugins that should own `setpoint_position/local`, `cellular_status/status`
+#  and so on all end up creating topics directly under the UAS node, so
+#  several of them collide on the same relative name and rclcpp aborts the
+#  entire process:
+#
+#      create_subscription() called for existing topic name
+#      rt/mavros/mavros/status with incompatible type
+#      mavros_msgs::msg::dds_::CompanionProcessStatus_
+#      terminate called after throwing an instance of RCLError
+#
+#  Collisions confirmed by bisecting the plugin set on this machine:
+#
+#      ~/status : cellular_status (sub, CellularStatus)
+#                 companion_process_status (sub, CompanionProcessStatus)
+#                 mag_calibration_status (pub, std_msgs/UInt8)
+#      ~/local  : local_position  <->  setpoint_position   [mutually exclusive]
+#
+#  This is NOT caused by anything in this project: a bare
+#  `ros2 run mavros mavros_node --ros-args -p fcu_url:=...` aborts identically,
+#  and the stock apm_pluginlists.yaml denies none of the offenders.
+#
+#  An allowlist is used rather than a denylist because denying the offenders
+#  one at a time is whack-a-mole. Loading ~10 plugins instead of ~90 also cuts
+#  MAVROS startup time noticeably.
+#
+#  TRADE-OFF: setpoint_position is NOT loaded, because it cannot coexist with
+#  local_position, and local_position is what publishes the pose that drives
+#  the odom->base_link TF the whole Nav2 costmap depends on. The mission node
+#  steers with velocity setpoints, so it does not need setpoint_position. The
+#  legacy GPS demos (waypoint_nav_node, obstacle_nav_node, nav2_obstacle_node)
+#  DO use /mavros/setpoint_position/global — to run those, swap
+#  `local_position` for `setpoint_position` below.
+# ══════════════════════════════════════════════════════════════════════════
+
+/**:
+  ros__parameters:
+    plugin_allowlist:
+      # ── Connection, heartbeat, mode changes ───────────────────────────
+      - sys_status          # /mavros/state, /mavros/set_mode
+      - sys_time            # clock sync with the FCU
+
+      # ── Arming, takeoff, land ─────────────────────────────────────────
+      - command             # /mavros/cmd/{arming,takeoff,land}
+
+      # ── Telemetry ─────────────────────────────────────────────────────
+      - local_position      # /mavros/local_position/pose (ENU) -> drives TF
+      - global_position     # /mavros/global_position/global
+      - imu
+      - home_position
+
+      # ── Control output ────────────────────────────────────────────────
+      - setpoint_velocity   # /mavros/setpoint_velocity/cmd_vel_unstamped
+
+      # ── Housekeeping ──────────────────────────────────────────────────
+      - param
+      - rc_io

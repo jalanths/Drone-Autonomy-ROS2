@@ -3,18 +3,33 @@
 <package format="3">
   <name>drone_autonomy</name>
   <version>0.0.0</version>
-  <description>Autonomous logic for Tarot 650 with ROS 2 and MAVROS</description>
-  <maintainer email="user@example.com">jalanth</maintainer>
-  <license>TODO: License declaration</license>
+  <description>
+    Autonomous 6-waypoint navigation with dynamic obstacle avoidance and smart
+    retrace for the Tarot 650, built on ROS 2 Humble + MAVROS + Nav2 costmaps
+    and simulated with ArduPilot SITL + Gazebo Classic 11.
+  </description>
+  <maintainer email="capstone.aerix@gmail.com">jalanth</maintainer>
+  <license>Apache-2.0</license>
 
   <depend>rclpy</depend>
   <depend>mavros_msgs</depend>
   <depend>geographic_msgs</depend>
   <depend>geometry_msgs</depend>
   <depend>sensor_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>visualization_msgs</depend>
+  <depend>gazebo_msgs</depend>
   <depend>nav2_costmap_2d</depend>
   <depend>nav2_lifecycle_manager</depend>
   <depend>tf2_ros</depend>
+  <depend>python3-numpy</depend>
+
+  <exec_depend>mavros</exec_depend>
+  <exec_depend>gazebo_ros</exec_depend>
+  <exec_depend>rviz2</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

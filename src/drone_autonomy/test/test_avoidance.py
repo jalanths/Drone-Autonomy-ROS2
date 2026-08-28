@@ -981,6 +981,17 @@ def main():
             class linear:
                 x, y, z = 1.25, -0.4, 0.0
 
+    # THE BUG A UNIT TEST MISSED AND A FLIGHT FOUND: the callback was
+    # correct, but it was wired to a topic with zero publishers. MAVROS puts
+    # the pose on /mavros/local_position/pose and the velocity on
+    # /mavros/mavros/velocity_local, and the symmetric-looking name does not
+    # exist. The node fell back to differenced pose for an entire flight
+    # without a word. Subscribe to both names and pin it here.
+    subs = {s.topic_name for s in node.subscriptions}
+    for topic in ('/mavros/local_position/velocity_local',
+                  '/mavros/mavros/velocity_local'):
+        check(f"subscribed to {topic}", topic in subs)
+
     node.vel_ok = False
     node.vel_cb(FakeTwist)
     check("vel_cb takes the fused ENU velocity straight from MAVROS",
@@ -1014,6 +1025,93 @@ def main():
     check("a silent velocity topic falls back to differenced pose",
           abs(node.vel_enu[0] - 5.0) < 1e-6,
           f"vel_enu = {node.vel_enu} after 2 s without a fused message")
+
+    print("\n── 31. Escape bearings are COMMITTED, not recomputed ─────────")
+    # THE CRASH THIS FIXES (2026-08-28, WP4 leg). A dynamic block boxed the
+    # drone in. The retreat bearing was recomputed every tick from whatever
+    # was nearest right then, so it retreated at -13 deg, then -68 deg, then
+    # -98 deg inside six seconds — three velocity reversals on top of three
+    # emergency brakes. EKF3 gave up: "EKF variance: over thresholds", "GPS
+    # Glitch or Compass error", failsafe to LAND, and the altitude estimate
+    # jumped from 4.0 m to -6.2 m. The estimator failed first; the crash
+    # followed.
+    node._latched = {}
+    clock['t'] += 100.0
+
+    first, held = node.committed_bearing('backoff', math.radians(10.0))
+    check("the first bearing offered is the one flown",
+          abs(deg(wrap_pi(first - math.radians(10.0)))) < 1e-6
+          and held == 0.0,
+          f"latched {deg(first):.0f}°")
+
+    # Immediately afterwards the scan says "actually, go the other way".
+    # Inside the commit window that must be IGNORED — this is the reversal.
+    clock['t'] += 0.2
+    same, held = node.committed_bearing('backoff', math.radians(-170.0))
+    check("a reversal inside the commit window is ignored",
+          abs(deg(wrap_pi(same - first))) < 1e-6,
+          f"still flying {deg(same):.0f}°, not {-170.0:.0f}° (held {held:.1f} s)")
+
+    # After the commit window, a genuinely opposed direction DOES win —
+    # committing must not mean flying into a wall forever.
+    clock['t'] += node.backoff_commit_s + 0.1
+    flipped, _ = node.committed_bearing('backoff', math.radians(-170.0))
+    check("after backoff_commit_s an opposed direction is adopted",
+          abs(deg(wrap_pi(flipped - math.radians(-170.0)))) < 1e-6,
+          f"now flying {deg(flipped):.0f}°")
+
+    # ...but small changes never re-latch, even after the window. Those are
+    # bin noise on a min-per-sector statistic, not new information.
+    clock['t'] += node.backoff_commit_s + 0.1
+    steady, _ = node.committed_bearing('backoff', math.radians(-150.0))
+    check("a 20 deg wobble does NOT re-latch",
+          abs(deg(wrap_pi(steady - flipped))) < 1e-6,
+          f"held {deg(steady):.0f}° against a {20}° nudge")
+
+    check("releasing lets the next entry choose fresh",
+          (node.release_bearing('backoff'),
+           abs(deg(wrap_pi(node.committed_bearing('backoff',
+                                                  math.radians(45.0))[0]
+                           - math.radians(45.0)))) < 1e-6)[1],
+          "re-entry after release picks the new bearing")
+
+    # THE REPLAY. Feed the exact bearings from the crash and confirm the
+    # commanded direction no longer spins.
+    node._latched = {}
+    clock['t'] += 100.0
+    crash_seq = [-13.0, -68.0, -98.0]      # degrees, ~2 s apart in the log
+    flown = []
+    for b in crash_seq:
+        clock['t'] += 2.0
+        d, _ = node.committed_bearing('backoff', math.radians(b))
+        flown.append(deg(d))
+    swings = [abs(deg(wrap_pi(math.radians(a) - math.radians(b))))
+              for a, b in zip(flown, flown[1:])]
+    worst = max(swings) if swings else 0.0
+    check("replaying the crash bearings no longer spins the velocity vector",
+          worst <= 90.0 + 1e-6,
+          f"commanded {[f'{f:.0f}°' for f in flown]}, worst swing "
+          f"{worst:.0f}° (raw input swung "
+          f"{max(abs(a - b) for a, b in zip(crash_seq, crash_seq[1:])):.0f}°)")
+
+    # The squeeze picks its bearing by argmax over a noisy per-bin minimum,
+    # so it hops between comparable gaps. Same latch, same reason.
+    node._latched = {}
+    clock['t'] += 100.0
+    sq1, _ = node.committed_bearing('squeeze', math.radians(30.0))
+    clock['t'] += 0.2
+    sq2, _ = node.committed_bearing('squeeze', math.radians(-160.0))
+    check("the trap squeeze commits to its bearing too",
+          abs(deg(wrap_pi(sq2 - sq1))) < 1e-6,
+          f"held {deg(sq2):.0f}° through a 170° argmax hop")
+    check("back-off and squeeze latches are independent",
+          'backoff' not in node._latched and 'squeeze' in node._latched,
+          "one reflex must not steal the other's commitment")
+
+    check("exit hysteresis exceeds nothing-at-all",
+          node.backoff_release_margin > 0.0,
+          f"must open {node.backoff_release_margin:.1f} m beyond "
+          f"{node.backoff_range:.1f} m before the reflex lets go")
 
     node.destroy_node()
     rclpy.shutdown()

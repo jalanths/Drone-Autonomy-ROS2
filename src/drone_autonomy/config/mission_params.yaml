@@ -257,6 +257,25 @@ mission_avoidance_node:
                               # livelock 21-26 m short of WP6.
     backoff_speed: 0.6        # m/s retreat. Gentle: the point is to open the
                               # gap without provoking the estimator.
+    backoff_commit_s: 1.5     # s a chosen retreat bearing is FLOWN before the
+                              # drone is allowed to pick a different one.
+                              # Without this the bearing was recomputed every
+                              # tick from whatever was nearest right then, so
+                              # with obstacles on several sides the commanded
+                              # velocity vector rotated: -13°, -68°, -98° in
+                              # six seconds on 2026-08-28, on top of three
+                              # emergency brakes. EKF3 gave up — "EKF
+                              # variance: over thresholds", failsafe to LAND,
+                              # altitude estimate jumping 4.0 m -> -6.2 m.
+                              # Even then a re-latch needs the new direction
+                              # to be >90° from the one being flown; smaller
+                              # changes are bin noise, not new information.
+    backoff_release_margin: 0.5
+                              # m further than backoff_range the drone must
+                              # get before the reflex lets go. Without the
+                              # hysteresis it chatters in and out of back-off
+                              # at the boundary, and every transition is
+                              # another velocity step.
     detour_max_drift: 8.0     # m further from the target than the detour
                               # started before it is aborted as a runaway. The
                               # drone once closed to 16.8 m of WP6 and a

@@ -169,6 +169,8 @@ class MissionAvoidanceNode(Node):
         self.declare_parameter('backoff_range', 1.5)
         self.declare_parameter('backoff_arc', 80.0)
         self.declare_parameter('backoff_speed', 0.6)
+        self.declare_parameter('backoff_commit_s', 1.5)
+        self.declare_parameter('backoff_release_margin', 0.5)
         self.declare_parameter('detour_max_drift', 8.0)
         self.declare_parameter('no_detour_radius', 25.0)
         self.declare_parameter('detour_leave_margin', 3.0)
@@ -269,6 +271,12 @@ class MissionAvoidanceNode(Node):
         self.backoff_range = p('backoff_range').value
         self.backoff_arc = p('backoff_arc').value
         self.backoff_speed = p('backoff_speed').value
+        self.backoff_commit_s = p('backoff_commit_s').value
+        self.backoff_release_margin = p('backoff_release_margin').value
+        # Latched escape bearings, keyed by the reflex that owns them.
+        # See committed_bearing() for why these are latched at all.
+        self._latched = {}
+        self.backoff_dir = None
         self.detour_max_drift = p('detour_max_drift').value
         self.no_detour_radius = p('no_detour_radius').value
         self.detour_leave_margin = p('detour_leave_margin').value
@@ -434,10 +442,19 @@ class MissionAvoidanceNode(Node):
         # sample difference of a pose that itself carries centimetre jitter is
         # a poor way to measure a fraction of a metre per second; the fused
         # estimate is far quieter and costs one subscription.
-        self.create_subscription(TwistStamped,
-                                 '/mavros/local_position/velocity_local',
-                                 self.vel_cb, sensor_qos,
-                                 callback_group=self.ctrl_cbg)
+        #
+        # TWO topic names, because MAVROS is not consistent about where it
+        # puts this and the answer varies by version and namespace layout.
+        # On this stack the pose lands on /mavros/local_position/pose but the
+        # velocity lands on /mavros/mavros/velocity_local, and subscribing to
+        # the matching /mavros/local_position/velocity_local found a topic
+        # with ZERO publishers — the node fell back to differenced pose for a
+        # whole flight without ever saying so. Subscribing to both costs
+        # nothing: only one of them ever publishes, and vel_cb is idempotent.
+        for topic in ('/mavros/local_position/velocity_local',
+                      '/mavros/mavros/velocity_local'):
+            self.create_subscription(TwistStamped, topic, self.vel_cb,
+                                     sensor_qos, callback_group=self.ctrl_cbg)
 
         self.vel_pub = self.create_publisher(
             Twist, '/mavros/setpoint_velocity/cmd_vel_unstamped', 10)
@@ -1540,19 +1557,30 @@ class MissionAvoidanceNode(Node):
             cand = np.where(ahead & np.isfinite(nearest), nearest, np.inf)
             b_min = int(np.argmin(cand))
             d_min = float(cand[b_min])
-            if d_min < self.backoff_range:
+            # HYSTERESIS on the exit: once retreating, the drone must open a
+            # real gap before the reflex lets go, or it chatters in and out of
+            # back-off at the boundary and each transition is a velocity step.
+            trigger = self.backoff_range
+            if self.backoff_dir is not None:
+                trigger += self.backoff_release_margin
+            if d_min < trigger:
                 bin_w = 2.0 * math.pi / self.nbins
                 toward = wrap_pi(-math.pi + (b_min + 0.5) * bin_w)
-                away = wrap_pi(toward + math.pi)
+                want = wrap_pi(toward + math.pi)
+                away, held = self.committed_bearing('backoff', want)
+                self.backoff_dir = away
                 self.status = 'BACK-OFF'
                 self._throttled(
                     f'  🚨 BACK-OFF — {d_min:.2f} m at '
-                    f'{math.degrees(toward):.0f}°, retreating',
+                    f'{math.degrees(toward):.0f}°, retreating along '
+                    f'{math.degrees(away):.0f}° (held {held:.1f} s)',
                     2.0, key='backoff')
                 self.send_velocity(math.cos(away) * self.backoff_speed,
                                    math.sin(away) * self.backoff_speed,
                                    self.climb_vz(), 0.0)
                 return
+            self.release_bearing('backoff')
+            self.backoff_dir = None
 
         # ── Resting on something ──────────────────────────────────────────
         # Checked before any other reflex, because none of them are meaningful
@@ -1600,18 +1628,36 @@ class MissionAvoidanceNode(Node):
                 self.get_logger().warn(
                     f'  🆘 TRAPPED 360° — climbing to {self.target_alt:.1f} m to fly over')
             elif self.trap_ticks > confirm and self.trap_ticks % max(1, int(1.5 / self.dt)) == 0:
-                # Still boxed in after climbing — go higher.
-                self.target_alt = min(self.target_alt + self.escape_step,
-                                      self.max_escape_alt)
-                self.get_logger().warn(f'  🆘 Still trapped — escalating to '
-                                       f'{self.target_alt:.1f} m')
+                # Still boxed in after climbing — go higher, IF there is
+                # anywhere higher to go. Under the 4 m envelope there is not,
+                # and the old code still logged "escalating to 4.0 m" while
+                # sitting at 4.0 m: an escalation that cannot happen,
+                # announced as though it had. That line cost real time during
+                # the 2026-08-28 post-mortem, because it reads as the escape
+                # working when the truth is that the squeeze below is the
+                # only thing acting.
+                room = self.max_escape_alt - self.target_alt
+                if room > 0.5:
+                    self.target_alt = min(self.target_alt + self.escape_step,
+                                          self.max_escape_alt)
+                    self.get_logger().warn(f'  🆘 Still trapped — escalating to '
+                                           f'{self.target_alt:.1f} m')
+                else:
+                    self.get_logger().warn(
+                        f'  🆘 Still trapped at the {self.max_escape_alt:.1f} m '
+                        f'ceiling — no climb available, squeezing out sideways')
             # At the ceiling, climbing cannot help; hovering there is a
             # deadlock. Fall back to the roomiest bearing and push horizontally
             # — a best-effort squeeze beats freezing in mid-air.
             if self.pos[2] >= self.max_escape_alt - 0.5:
                 b = int(np.argmax(np.where(np.isfinite(nearest), nearest, self.lookahead)))
                 bin_w = 2.0 * math.pi / self.nbins
-                esc = wrap_pi(-math.pi + (b + 0.5) * bin_w)
+                want = wrap_pi(-math.pi + (b + 0.5) * bin_w)
+                # Latched for the same reason the retreat is: "the roomiest
+                # bearing" is an argmax over a noisy per-bin minimum, so it
+                # hops between comparable gaps every tick and the squeeze
+                # turns into a rotating velocity command.
+                esc, _ = self.committed_bearing('squeeze', want)
                 self.status = 'TRAPPED-SQUEEZE'
                 self.send_velocity(math.cos(esc) * self.min_speed,
                                    math.sin(esc) * self.min_speed,
@@ -2063,6 +2109,41 @@ class MissionAvoidanceNode(Node):
     # ══════════════════════════════════════════════════════════════════════
     #  Actuation
     # ══════════════════════════════════════════════════════════════════════
+
+    def committed_bearing(self, key, want, commit_s=None):
+        """Latch an escape bearing so the drone commits instead of spinning.
+
+        Every reflex that picks a direction from the CURRENT scan — retreat
+        from the nearest return, squeeze toward the roomiest gap — recomputes
+        that direction each tick. With obstacles on several sides the winning
+        bin hops between them and the commanded velocity vector rotates,
+        which the airframe answers with a sequence of reversals.
+
+        That is what killed the 2026-08-28 flight: retreats at -13 deg, then
+        -68 deg, then -98 deg inside six seconds, on top of three emergency
+        brakes, ending in "EKF variance: over thresholds" and a failsafe to
+        LAND with the altitude estimate jumping 4.0 m -> -6.2 m.
+
+        So a bearing, once chosen, is FLOWN. It is replaced only after
+        commit_s has given it a chance to work, and only if the direction now
+        wanted is genuinely opposed (>90 deg) rather than jitter. This is the
+        same commitment the tangent-bug detour already makes for the same
+        reason; these reflexes simply never got it.
+        """
+        if commit_s is None:
+            commit_s = self.backoff_commit_s
+        now = self.now()
+        held = self._latched.get(key)
+        if (held is None
+                or (now - held[1] > commit_s
+                    and abs(wrap_pi(want - held[0])) > math.radians(90.0))):
+            self._latched[key] = (want, now)
+            return want, 0.0
+        return held[0], now - held[1]
+
+    def release_bearing(self, key):
+        """Forget a latched bearing, so the next entry picks a fresh one."""
+        self._latched.pop(key, None)
 
     def climb_vz(self):
         """P-controller onto the current target altitude."""

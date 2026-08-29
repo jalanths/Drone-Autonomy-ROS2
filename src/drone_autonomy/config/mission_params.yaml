@@ -416,17 +416,6 @@ mission_avoidance_node:
                               # single crossing obstacle cannot cause stop/go
                               # stuttering
     brake_stop_speed: 0.25     # m/s below which the drone counts as stopped and
-    brake_creep_arc: 60.0     # deg — while the brake window is open and the
-                              # goal bearing reads clear, the drone creeps at
-                              # min_speed rather than resuming cruise. It must
-                              # NOT creep within this arc of whatever opened
-                              # the window: a single moving block does not
-                              # blank enough of the histogram to stop the goal
-                              # bearing reading 'clear', so the creep drove
-                              # straight into it. 2026-08-29, retrace
-                              # breadcrumb 25: threat held 20-23 deg off the
-                              # nose while the gap went 5.9 -> 3.9 -> 1.6 m,
-                              # ending in a LAND failsafe.
                               # may start looking for a gap
     evade_cooldown_s: 0.4     # s minimum between evades. One persistent threat
                               # used to fire dozens of velocity reversals in a

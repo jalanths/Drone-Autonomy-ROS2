@@ -297,9 +297,6 @@ class MissionAvoidanceNode(Node):
         self.declare_parameter('brake_hold_s', 1.5)          # s to stay stopped
                                                             # after last detection
         self.declare_parameter('brake_stop_speed', 0.25)      # m/s = 'stopped'
-        self.declare_parameter('brake_creep_arc', 60.0)      # deg; do not creep
-                                                            # within this arc of
-                                                            # a known threat
         self.declare_parameter('terrain_close_range', 2.0)   # m
         self.declare_parameter('terrain_close_sectors', 12)  # simultaneous sectors
         self.declare_parameter('terrain_below_margin', 0.2)  # m the hit must sit
@@ -423,7 +420,6 @@ class MissionAvoidanceNode(Node):
         self.brake_stop_speed = p('brake_stop_speed').value
         self.terrain_close_range = p('terrain_close_range').value
         self.terrain_close_sectors = int(p('terrain_close_sectors').value)
-        self.brake_creep_arc = float(p('brake_creep_arc').value)
         self.enable_prediction = bool(p('enable_prediction').value)
         self.track_cluster_gap = float(p('track_cluster_gap').value)
         self.track_min_points = int(p('track_min_points').value)
@@ -486,9 +482,6 @@ class MissionAvoidanceNode(Node):
         self.last_evade_t = -99.0
         self.braking = False
         self.brake_until = 0.0
-        self.brake_threat_bearing = None   # bearing of whatever opened the
-                                           # window, so the creep cannot
-                                           # advance onto it
         self.vel_enu = np.zeros(2)    # own ENU velocity, for closing-rate maths
         self.vel_fused_t = -99.0      # last /mavros/.../velocity_local message
         self.vel_ok = False
@@ -1672,46 +1665,6 @@ class MissionAvoidanceNode(Node):
                         float(np.linalg.norm(rel_p)), float(t_cpa))
         return best
 
-    def brake_action(self, mode, heading, speed_now,
-                     threat_bearing=None):
-        """
-        What the brake state machine does on one tick. Returns a status string.
-
-        Pure decision — no I/O, no state mutation — so the tests can exercise
-        THIS rather than a copy of its conditions. Section 26 is the reason
-        that matters: a test helper which reimplemented the terrain gate with
-        fewer conditions than production passed twice while the real gate
-        froze the drone twice.
-
-          EMERGENCY-BRAKE  still carrying momentum; kill it first
-          BRAKE-HOLD       stopped, nothing open — wait rather than invent a
-                           direction
-          BRAKE-SIDESTEP   stopped, route blocked, a gap exists — ease into it
-          BRAKE-CREEP      stopped, goal bearing clear, window still open —
-                           advance, but at min_speed, not back at cruise
-        """
-        if speed_now > self.brake_stop_speed:
-            return 'EMERGENCY-BRAKE'
-        if heading is None:
-            return 'BRAKE-HOLD'
-        if mode != 'clear':
-            return 'BRAKE-SIDESTEP'
-        # THE CREEP MUST NOT CLOSE ON THE THREAT.
-        #
-        # When mode == 'clear', `heading` IS the goal bearing — and a single
-        # moving block does not blank a wide enough arc to stop the histogram
-        # reading clear, so the goal bearing stays 'free' with the block
-        # sitting right on it. The first version of this crept at min_speed
-        # straight into what it had just braked for: on 2026-08-29 the threat
-        # held 20-23 deg off the nose while the gap went 5.9 -> 3.9 -> 1.6 m,
-        # and the flight ended in a LAND failsafe. Braking bought 4.9 s of
-        # warning and the creep spent all of it.
-        if (threat_bearing is not None
-                and abs(wrap_pi(heading - threat_bearing))
-                < math.radians(self.brake_creep_arc)):
-            return 'BRAKE-HOLD'
-        return 'BRAKE-CREEP'
-
     # ══════════════════════════════════════════════════════════════════════
     #  Main state machine
     # ══════════════════════════════════════════════════════════════════════
@@ -2249,52 +2202,61 @@ class MissionAvoidanceNode(Node):
             # Keep braking for a while after the last detection, so a single
             # crossing obstacle does not cause stop/go stuttering.
             self.brake_until = self.now() + self.brake_hold_s
-            self.brake_threat_bearing = t_bearing
 
         if self.now() < self.brake_until:
-            # THE WINDOW IS NOT CANCELLABLE FROM IN HERE.
-            #
-            # This used to zero brake_until the moment `mode == 'clear'`,
-            # which defeated brake_hold_s entirely. `mode` is the VFH verdict
-            # about the GOAL BEARING, and a block crossing abeam leaves the
-            # goal bearing clear for the whole time it is passing — so the
-            # window was cancelled on the tick after it opened. The drone
-            # braked, read clear, accelerated back to cruise, re-detected the
-            # same block and braked again: 144 emergency brakes and 18
-            # no-progress replans across one 279 m flight, a brake every 2 m.
-            #
-            # brake_until is refreshed on every tick a threat is seen, so
-            # simply letting it run out IS the documented behaviour —
-            # brake_hold_s after the LAST detection. Same lesson as the
-            # terrain gate: trust the window's memory, not a flag that a
-            # single clear scan can flip.
-            #
-            # Progress is preserved by creeping rather than holding: with the
-            # goal bearing clear the drone still advances, at min_speed
-            # instead of cruise, so it makes ground without charging back at
-            # whatever it just braked for.
-            self.status = self.brake_action(
-                mode, heading, float(np.linalg.norm(self.vel_enu)),
-                self.brake_threat_bearing)
-            if self.status in ('EMERGENCY-BRAKE', 'BRAKE-HOLD'):
+            speed_now = float(np.linalg.norm(self.vel_enu))
+
+            # 1. BRAKE — still carrying momentum.
+            if speed_now > self.brake_stop_speed:
+                self.status = 'EMERGENCY-BRAKE'
                 self.send_velocity(0.0, 0.0, self.climb_vz(), 0.0)
+                return
+
+            # 4. RESUME — the route opened up while we were stopped.
+            #
+            # THIS CANCELLATION LOOKS WRONG AND IS LOAD-BEARING. `mode` is the
+            # VFH verdict about the GOAL BEARING, so a block crossing abeam
+            # leaves it clear and the window is cancelled a tick after it
+            # opens — which does make brake_hold_s a lie, and costs 123
+            # cancellations, 144 brakes and 18 no-progress replans over a
+            # 279 m flight.
+            #
+            # It was fixed on 2026-08-29 by making the window uncancellable.
+            # Every targeted metric improved — cancellations to 0, brakes to
+            # 54, dodges 120 -> 74 — and the aircraft was lost twice, once on
+            # the retrace and once at WP1, against one clean 279 m mission
+            # plus retrace on this code.
+            #
+            # The reason is that the dynamic blocks run at 1.0 m/s and cruise
+            # is 0.8. Holding the drone stopped or creeping at min_speed for
+            # brake_hold_s after every detection removes the only thing that
+            # can actually open a gap. The second failure is unambiguous: the
+            # threat sat at 161-163 deg — BEHIND — closing 6.2 -> 3.9 -> 1.8 m
+            # while the state machine crept away at 0.4 m/s from something
+            # overtaking at 1.0.
+            #
+            # Braking is the right answer to a crossing obstacle and the wrong
+            # answer to a pursuing one, and this code cannot tell them apart.
+            # Cancelling on a clear goal bearing is semantically incoherent but
+            # operationally returns the speed that constitutes the escape. Do
+            # not "fix" this without a response that keeps the drone fast.
+            if mode == 'clear':
+                self.brake_until = 0.0
+                self.braking = False
+                self.get_logger().info('  ✅ Path clear again — resuming.')
             else:
-                self.send_velocity(math.cos(heading) * self.min_speed,
-                                   math.sin(heading) * self.min_speed,
-                                   self.climb_vz(), 0.0)
-            # An uncancellable window must not also be a silent one. Every
-            # path here used to return before log_progress, so once the window
-            # stopped being cancelled the log went quiet for minutes with only
-            # the planner ticking — a dead aircraft looked like a slow one.
-            self.log_progress(leg_kind, dist, mode,
-                              float(np.min(nearest)))
-            return
+                # 2/3. ASSESS then SIDESTEP, or HOLD if nothing is open.
+                if heading is not None:
+                    self.status = 'BRAKE-SIDESTEP'
+                    self.send_velocity(math.cos(heading) * self.min_speed,
+                                       math.sin(heading) * self.min_speed,
+                                       self.climb_vz(), 0.0)
+                else:
+                    self.status = 'BRAKE-HOLD'
+                    self.send_velocity(0.0, 0.0, self.climb_vz(), 0.0)
+                return
         else:
-            if self.braking:
-                self.get_logger().info(
-                    '  ✅ Brake window expired — resuming course.')
             self.braking = False
-            self.brake_threat_bearing = None
 
         # ── Normal steering ───────────────────────────────────────────────
         if mode == 'dodge':

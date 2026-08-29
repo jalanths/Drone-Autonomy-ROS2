@@ -9,6 +9,7 @@ ArduPilot and MAVROS.
     python3 src/drone_autonomy/test/test_avoidance.py
 """
 
+import inspect
 import math
 import sys
 import time
@@ -17,7 +18,8 @@ import numpy as np
 import rclpy
 
 sys.path.insert(0, __file__.rsplit('/test/', 1)[0])
-from drone_autonomy.mission_avoidance_node import MissionAvoidanceNode, wrap_pi  # noqa: E402
+from drone_autonomy.mission_avoidance_node import (  # noqa: E402
+    MissionAvoidanceNode, wrap_pi, cpa)
 
 RES = 0.1
 SIZE = 400                      # 40 m window at 0.1 m/cell
@@ -1140,6 +1142,245 @@ def main():
           node.backoff_release_margin > 0.0,
           f"must open {node.backoff_release_margin:.1f} m beyond "
           f"{node.backoff_range:.1f} m before the reflex lets go")
+
+    print("\n── 32. Predicting where a dynamic obstacle will BE ────────────")
+    #
+    # Everything above this line reasons about where obstacles ARE. VFH asks
+    # "which bearings are free right now"; the TTC guard differences a
+    # per-sector minimum range to get a radial closing rate. Neither can
+    # answer "will that thing and I try to occupy the same point?", because
+    # sectorizing the scan throws away the TANGENTIAL component of the
+    # obstacle's motion — and that is the half that says where it is going.
+    #
+    # This section tests the layer that recovers it: cluster the raw scan into
+    # objects, track their centroids frame to frame, and close the geometry
+    # with a closest-point-of-approach test.
+    #
+    # It is flag-gated and OFF by default. These tests turn it on explicitly.
+
+    clk = {'t': 500.0}
+    node.now = lambda: clk['t']
+
+    def reset_pred(pos=(0.0, 0.0), vel=(0.0, 0.0), yaw=0.0):
+        node.pos = np.array([pos[0], pos[1], 4.0])
+        node.yaw = yaw
+        node.roll = node.pitch = 0.0
+        node.vel_enu = np.array([vel[0], vel[1]], dtype=float)
+        node.costmap = None
+        node.tracks = []
+
+    def scan_from(blobs, nbeams=360, rng=30.0):
+        """Synthesize a 360-beam LaserScan seeing `blobs` = [(x, y, half_width)]
+        in WORLD coordinates, as observed from node.pos / node.yaw."""
+        inc = 2.0 * math.pi / nbeams
+        rr = [float('inf')] * nbeams
+        for (px, py, hw) in blobs:
+            dx, dy = px - node.pos[0], py - node.pos[1]
+            d = math.hypot(dx, dy)
+            b = math.atan2(dy, dx) - node.yaw
+            half = math.asin(min(0.99, hw / max(d, hw)))
+            i0 = int(math.floor((b - half + math.pi) / inc))
+            i1 = int(math.ceil((b + half + math.pi) / inc))
+            for i in range(i0, i1 + 1):
+                rr[i % nbeams] = min(rr[i % nbeams], d)
+
+        class S:
+            angle_min = -math.pi
+            angle_increment = inc
+            range_min = 0.3
+            range_max = rng
+            ranges = rr
+        return S()
+
+    # ── A. The flag genuinely gates the whole layer ───────────────────────
+    check("prediction is OFF by default",
+          node.get_parameter('enable_prediction').value is False,
+          "a new capability must not change how the aircraft flies "
+          "until it is asked for")
+
+    reset_pred()
+    node.enable_prediction = False
+    node.scan = scan_from([(5.0, 0.0, 1.0)])
+    node.update_tracks()
+    check("disabled: no tracks are built at all",
+          node.tracks == [], f"{len(node.tracks)} tracks")
+    check("disabled: predict_threat() is always None",
+          node.predict_threat() is None)
+
+    node.enable_prediction = True
+
+    # ── B. The CPA geometry itself ────────────────────────────────────────
+    # Pure function, no sensor, no node state — this is the arithmetic the
+    # whole layer rests on, so it is pinned exactly.
+    t, d = cpa(np.array([10.0, 0.0]), np.array([-2.0, 0.0]))
+    check("head-on: impact in 5 s, miss distance 0",
+          abs(t - 5.0) < 1e-9 and d < 1e-9, f"t={t:.2f}s d={d:.2f}m")
+
+    t, d = cpa(np.array([10.0, 0.0]), np.array([2.0, 0.0]))
+    check("receding obstacle yields a NEGATIVE time — never a threat",
+          t < 0.0, f"t={t:.2f}s")
+
+    # The case the radial guard cannot express: genuinely closing, and it will
+    # still miss us by several metres.
+    t, d = cpa(np.array([4.0, 6.0]), np.array([-1.5, -0.8]))
+    check("closing fast but crossing WELL clear: 3.7 s out, misses by 3.4 m",
+          2.0 < t < 5.0 and d > 3.0, f"t={t:.2f}s d={d:.2f}m")
+
+    # Flying in formation: zero relative motion must not divide by zero.
+    t, d = cpa(np.array([3.0, 0.0]), np.array([0.0, 0.0]))
+    check("zero relative velocity is not an intercept (and does not divide "
+          "by zero)", not (0.0 < t < 1e6), f"t={t}")
+
+    # ── C. Clustering the raw scan into objects ───────────────────────────
+    reset_pred()
+    node.scan = scan_from([(5.0, 0.0, 1.0), (0.0, -5.0, 1.0)])
+    cl = node.cluster_scan()
+    check("two separated blobs -> two clusters",
+          len(cl) == 2, f"{len(cl)} clusters")
+    if len(cl) == 2:
+        cl_sorted = sorted(cl, key=lambda c: c[0])
+        east = max(cl, key=lambda c: c[0])
+        check("cluster centroid lands on the object, in WORLD coordinates",
+              abs(east[0] - 5.0) < 0.4 and abs(east[1]) < 0.4,
+              f"centroid ({east[0]:.2f}, {east[1]:.2f}) vs true (5.00, 0.00)")
+
+    # THE SEAM. A blob straight behind the drone straddles the -pi/+pi wrap.
+    # Split naively it becomes two half-objects, each with half the beams and
+    # a centroid that is in the wrong place — and two phantom objects that
+    # appear and vanish as the drone yaws.
+    reset_pred()
+    node.scan = scan_from([(-5.0, 0.0, 1.0)])
+    cl = node.cluster_scan()
+    check("an object across the +/-180 deg seam stays ONE object",
+          len(cl) == 1, f"{len(cl)} clusters")
+    if cl:
+        check("...and its centroid is still correct",
+              abs(cl[0][0] + 5.0) < 0.4 and abs(cl[0][1]) < 0.4,
+              f"centroid ({cl[0][0]:.2f}, {cl[0][1]:.2f}) vs true (-5.00, 0.00)")
+
+    # Stray single returns are noise, not obstacles.
+    reset_pred()
+    sp = scan_from([])
+    sp.ranges[10] = 4.0
+    sp.ranges[100] = 4.0
+    node.scan = sp
+    check("isolated single-beam returns are rejected as noise",
+          node.cluster_scan() == [], "need track_min_points beams to be an object")
+
+    # ── D. Velocity estimation from association ───────────────────────────
+    # A block sliding west at exactly 1.0 m/s — the real dyn_block_0 speed.
+    reset_pred()
+    bx, by = 6.0, 4.0
+    for _ in range(12):
+        node.scan = scan_from([(bx, by, 1.0)])
+        node.update_tracks()
+        clk['t'] += 0.1
+        bx -= 0.1                       # 1.0 m/s west
+    check("the moving block produced exactly one track",
+          len(node.tracks) == 1, f"{len(node.tracks)} tracks")
+    if len(node.tracks) == 1:
+        tv = node.tracks[0].vel
+        check("estimated velocity recovers the true 1.0 m/s westward",
+              abs(tv[0] + 1.0) < 0.25 and abs(tv[1]) < 0.25,
+              f"estimated ({tv[0]:+.2f}, {tv[1]:+.2f}) m/s vs true (-1.00, +0.00)")
+
+    # ── E. Static geometry must never reach the threat logic ──────────────
+    # Buildings and trees cluster beautifully. They are VFH's job, and a
+    # predictive layer that also fires on them would double every false alarm
+    # the persistence filter above exists to suppress.
+    reset_pred()
+    for _ in range(12):
+        node.scan = scan_from([(6.0, 0.0, 1.0)])
+        node.update_tracks()
+        clk['t'] += 0.1
+    check("a stationary object is tracked but never flagged",
+          len(node.tracks) == 1 and node.predict_threat() is None,
+          f"{len(node.tracks)} track(s), "
+          f"speed {float(np.linalg.norm(node.tracks[0].vel)):.2f} m/s "
+          f"< threshold {node.track_min_speed:.2f}")
+
+    # ── F. A dropped track must go quiet, not keep predicting ─────────────
+    # This is the failure mode that would fly the drone into something: a
+    # block passes behind a building, the track coasts on dead reckoning, and
+    # a stale velocity keeps answering questions it can no longer answer.
+    reset_pred()
+    bx, by = 5.0, 3.0
+    for _ in range(10):
+        node.scan = scan_from([(bx, by, 1.0)])
+        node.update_tracks()
+        clk['t'] += 0.1
+        bx -= 0.1
+    had = len(node.tracks)
+    clk['t'] += node.track_max_age_s + 0.2      # occluded — nothing arrives
+    node.scan = scan_from([])
+    node.update_tracks()
+    check("a track unseen for track_max_age_s is dropped, not coasted",
+          had == 1 and node.tracks == [],
+          f"{had} track before the occlusion, {len(node.tracks)} after "
+          f"{node.track_max_age_s:.1f} s blind")
+
+    # An object seen only briefly has a velocity estimate built from noise.
+    reset_pred()
+    node.scan = scan_from([(4.0, 2.0, 1.0)])
+    node.update_tracks()
+    check("a brand-new track cannot raise a threat on its first frame",
+          node.predict_threat() is None,
+          f"needs {node.track_confirm_frames} associations before it is trusted")
+
+    # ── G. REPLAY: dyn_block_0 crossing the HOME -> WP1 leg ───────────────
+    #
+    # The real geometry, in ENU. dyn_block_0 patrols gazebo (20,-14)-(20,14),
+    # which is ENU y=20 with x sweeping +/-14 at 1.0 m/s. WP1 is gazebo (40,0)
+    # = ENU (0,40), so the drone flies due north up x=0 at 0.8 m/s. They cross
+    # at (0, 20). This is the leg that has failed repeatedly.
+    #
+    # Set up a TRUE intercept: the drone is 3 m short of the crossing and the
+    # block is 3.75 m east of it, both arriving in 3.75 s.
+    reset_pred(pos=(0.0, 17.0), vel=(0.0, 0.8))
+    bx, by = 3.75, 20.0
+    for _ in range(8):
+        node.scan = scan_from([(bx, by, 1.0)])
+        node.update_tracks()
+        clk['t'] += 0.1
+        node.pos = np.array([node.pos[0], node.pos[1] + 0.08, 4.0])
+        bx -= 0.1
+    hit = node.predict_threat()
+    check("the WP1 crossing block is flagged BEFORE it is dangerous",
+          hit is not None, f"threat={hit}")
+    if hit is not None:
+        hb, hd, ht = hit
+        check("...with a sane time-to-intercept and it is still metres away",
+              1.5 < ht < 5.0 and hd > 3.0,
+              f"intercept in {ht:.1f} s, currently {hd:.1f} m away at "
+              f"{deg(hb):.0f}°")
+
+    # THE CONTROL. Identical geometry, block travelling the other way — it is
+    # leaving the drone's path, not crossing it. The range still shrinks for
+    # part of this, which is exactly what fools a radial-only test.
+    reset_pred(pos=(0.0, 17.0), vel=(0.0, 0.8))
+    bx, by = 3.75, 20.0
+    for _ in range(8):
+        node.scan = scan_from([(bx, by, 1.0)])
+        node.update_tracks()
+        clk['t'] += 0.1
+        node.pos = np.array([node.pos[0], node.pos[1] + 0.08, 4.0])
+        bx += 0.1                        # heading AWAY
+    check("the same block heading away is NOT flagged",
+          node.predict_threat() is None,
+          "prediction must buy silence as well as warnings")
+
+    # ── H. Composition: additive only, never a veto ───────────────────────
+    # The reflex above this layer has been earned over several crashes. The
+    # predictor may add a threat it missed; it may never remove one.
+    src = inspect.getsource(node.run_leg)
+    i_ttc = src.find('self.imminent_collision(')
+    i_pred = src.find('self.predict_threat(')
+    check("predict_threat() runs AFTER imminent_collision()",
+          i_ttc >= 0 and i_pred > i_ttc,
+          "the reflex keeps first refusal")
+    check("the predictor is only consulted when the reflex found nothing",
+          'if threat is None:' in src[i_ttc:i_pred],
+          "additive layer, not a replacement")
 
     node.destroy_node()
     rclpy.shutdown()

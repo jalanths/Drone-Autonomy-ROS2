@@ -352,6 +352,52 @@ mission_avoidance_node:
                               # handled from 10 m out. Only a genuinely MOVING
                               # obstacle closes faster than our velocity explains.
     hard_stop_distance: 0.7   # m — fire regardless of the above; true last resort
+
+    # ── Predicting where a dynamic obstacle will BE ────────────────────────
+    # OFF by default. Everything above measures where obstacles ARE; the
+    # sectorized histogram keeps only the RADIAL closing rate and throws away
+    # the tangential component, which is the half that says where a thing is
+    # going. This layer clusters the raw scan into objects, tracks their
+    # centroids, and closes the geometry with a closest-point-of-approach test
+    # — so a block crossing four metres clear stops looking like a threat, and
+    # a block on a true collision course stops hiding behind an unremarkable
+    # closing rate.
+    #
+    # It is strictly ADDITIVE: consulted only when the reflex above found
+    # nothing, and it can never suppress the reflex's own verdict.
+    #
+    #   ros2 launch drone_autonomy autonomy_launch.py  (then set true here)
+    enable_prediction: false
+    track_cluster_gap: 0.8    # m — a range step bigger than this separates two
+                              # objects. Wider than the 0.3 m the blocks' own
+                              # faces vary by, tighter than the gap to anything
+                              # standing behind them.
+    track_min_points: 3       # beams — fewer is a speckle, not an object
+    track_assoc_radius: 1.2   # m a centroid may move between frames. At 1.0 m/s
+                              # and 5-10 Hz that is 0.1-0.2 m, so this survives
+                              # a dropped frame with room to spare.
+    track_confirm_frames: 4   # associations before the velocity is believed.
+                              # A two-frame velocity is the difference of two
+                              # noisy centroids.
+    track_max_age_s: 0.6      # s unseen -> forget it. A track that coasts on
+                              # dead reckoning behind a building is how a
+                              # confident wrong answer gets produced.
+    track_min_speed: 0.35     # m/s — below this it is scenery. The visible-face
+                              # centroid drifts as the aspect changes, so static
+                              # objects report a small false velocity; this
+                              # swallows it, and VFH handles them anyway.
+    track_max_speed: 5.0      # m/s — above this the association is wrong.
+                              # The blocks run at 1.0 m/s.
+    track_alpha: 0.5          # alpha-beta position gain
+    track_beta: 0.25          # alpha-beta velocity gain
+    track_max_count: 12       # bounds the association cost in a busy street
+    cpa_horizon_s: 5.0        # s — ignore intercepts further off than this.
+                              # Constant velocity is a good model for a block on
+                              # a straight patrol leg and a poor one across its
+                              # turnaround, so do not extrapolate far.
+    cpa_miss_distance: 2.0    # m — a predicted gap smaller than this counts as
+                              # a hit. Half the 3 m block plus the airframe plus
+                              # margin.
     # ── Emergency brake (dynamic obstacles) ───────────────────────────────
     # The drone BRAKES rather than driving away from a closing obstacle.
     # Reversing demanded thrust in the opposite direction and, once the guard

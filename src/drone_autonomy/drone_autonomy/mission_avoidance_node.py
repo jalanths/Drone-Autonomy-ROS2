@@ -125,6 +125,69 @@ def rp_from_quat(q):
     return roll, pitch
 
 
+def cpa(rel_pos, rel_vel):
+    """
+    Closest point of approach between two bodies moving at constant velocity.
+
+    `rel_pos` is (them - us) and `rel_vel` is (their velocity - ours), both
+    2-vectors in a common frame. Returns (t_cpa, d_cpa): the time at which the
+    gap is smallest, and how big that gap will be.
+
+    WHY THIS AND NOT A CLOSING RATE
+    -------------------------------
+    Everything else in this node measures range and how fast range is
+    shrinking. That answers "is it getting nearer", which is not the question.
+    A block crossing four metres in front of the drone is getting nearer the
+    whole time and will never touch it; a block on a true collision course has
+    a constant bearing and, if the speeds happen to match, an unremarkable
+    closing rate. Range rate cannot separate those two. Relative geometry can:
+
+        gap(t) = |rel_pos + rel_vel * t|
+
+    is a parabola in t, and its minimum is the whole answer. Differentiating
+    and solving for zero gives t_cpa = -(rel_pos . rel_vel) / |rel_vel|^2.
+
+    Two degenerate cases matter, and both mean "no intercept":
+
+      * t_cpa <= 0 — the minimum is in the PAST. The gap is opening and will
+        keep opening. Returned as a negative time so the caller's `0 < t`
+        test rejects it without a special case.
+      * |rel_vel| ~ 0 — station keeping. There is no approach to have a
+        closest point of, and the formula would divide by zero. Returned as
+        infinite time, which fails any finite horizon test.
+
+    In both cases d_cpa is reported as the CURRENT separation, which is the
+    only honest answer when there is no future minimum to speak of.
+    """
+    rel_pos = np.asarray(rel_pos, dtype=float)
+    rel_vel = np.asarray(rel_vel, dtype=float)
+    vv = float(np.dot(rel_vel, rel_vel))
+    now_gap = float(np.linalg.norm(rel_pos))
+    if vv < 1e-6:
+        return float('inf'), now_gap
+    t = -float(np.dot(rel_pos, rel_vel)) / vv
+    if t <= 0.0:
+        return t, now_gap
+    return t, float(np.linalg.norm(rel_pos + rel_vel * t))
+
+
+class _Track:
+    """
+    One tracked object: a filtered position and velocity in the world frame.
+
+    Deliberately not a dataclass and deliberately tiny — one of these exists
+    per visible cluster and they are rebuilt constantly inside a 20 Hz loop.
+    """
+
+    __slots__ = ('pos', 'vel', 't', 'hits')
+
+    def __init__(self, pos, t):
+        self.pos = np.asarray(pos, dtype=float)
+        self.vel = np.zeros(2)
+        self.t = float(t)
+        self.hits = 1
+
+
 class MissionAvoidanceNode(Node):
 
     # ══════════════════════════════════════════════════════════════════════
@@ -239,6 +302,36 @@ class MissionAvoidanceNode(Node):
         self.declare_parameter('terrain_below_margin', 0.2)  # m the hit must sit
                                                             # below to count as ground
 
+        # Predicting where a dynamic obstacle will BE
+        #
+        # OFF by default. The reflexes above are the product of several
+        # crashes and they work; this layer is additive and unflown, so it
+        # does not get to change how the aircraft behaves until it is asked
+        # for by name.
+        self.declare_parameter('enable_prediction', False)
+        self.declare_parameter('track_cluster_gap', 0.8)   # m of range step
+                                                           # that splits two
+                                                           # objects apart
+        self.declare_parameter('track_min_points', 3)      # beams to be real
+        self.declare_parameter('track_assoc_radius', 1.2)  # m a centroid may
+                                                           # jump between frames
+        self.declare_parameter('track_confirm_frames', 4)  # associations before
+                                                           # the velocity is
+                                                           # believed
+        self.declare_parameter('track_max_age_s', 0.6)     # s unseen -> forget
+        self.declare_parameter('track_min_speed', 0.35)    # m/s below which it
+                                                           # is scenery
+        self.declare_parameter('track_max_speed', 5.0)     # m/s above which it
+                                                           # is an association
+                                                           # blunder
+        self.declare_parameter('track_alpha', 0.5)         # position gain
+        self.declare_parameter('track_beta', 0.25)         # velocity gain
+        self.declare_parameter('track_max_count', 12)
+        self.declare_parameter('cpa_horizon_s', 5.0)       # s; ignore intercepts
+                                                           # further off than this
+        self.declare_parameter('cpa_miss_distance', 2.0)   # m; closer than this
+                                                           # counts as a hit
+
         # Smart retrace
         self.declare_parameter('enable_retrace', True)
         self.declare_parameter('breadcrumb_spacing', 4.0)
@@ -314,6 +407,19 @@ class MissionAvoidanceNode(Node):
         self.brake_stop_speed = p('brake_stop_speed').value
         self.terrain_close_range = p('terrain_close_range').value
         self.terrain_close_sectors = int(p('terrain_close_sectors').value)
+        self.enable_prediction = bool(p('enable_prediction').value)
+        self.track_cluster_gap = float(p('track_cluster_gap').value)
+        self.track_min_points = int(p('track_min_points').value)
+        self.track_assoc_radius = float(p('track_assoc_radius').value)
+        self.track_confirm_frames = int(p('track_confirm_frames').value)
+        self.track_max_age_s = float(p('track_max_age_s').value)
+        self.track_min_speed = float(p('track_min_speed').value)
+        self.track_max_speed = float(p('track_max_speed').value)
+        self.track_alpha = float(p('track_alpha').value)
+        self.track_beta = float(p('track_beta').value)
+        self.track_max_count = int(p('track_max_count').value)
+        self.cpa_horizon_s = float(p('cpa_horizon_s').value)
+        self.cpa_miss_distance = float(p('cpa_miss_distance').value)
         self.terrain_below_margin = p('terrain_below_margin').value
         self.enable_retrace = p('enable_retrace').value
         self.breadcrumb_spacing = p('breadcrumb_spacing').value
@@ -357,6 +463,7 @@ class MissionAvoidanceNode(Node):
         self.hold_alt_logged = False
         self.terrain_logged = False
         self.sector_zoff = np.full(self.nbins, np.inf)
+        self.tracks = []              # [_Track] — see cluster_scan/update_tracks
         self.prev_nearest = None      # previous polar ranges, for closing speed
         self.prev_nearest_t = 0.0
         self.last_evade_t = -99.0
@@ -493,6 +600,13 @@ class MissionAvoidanceNode(Node):
         self.get_logger().info(f'  🧠 Avoidance    : VFH+ polar histogram '
                                f'({self.nbins} bins, {self.lookahead:.0f} m horizon)')
         self.get_logger().info(f'  🔁 Smart retrace: {"ON" if self.enable_retrace else "OFF"}')
+        # Printed unconditionally: "was prediction on for that flight?" must be
+        # answerable from the log alone, without diffing a config file.
+        self.get_logger().info(
+            f'  🔮 Prediction   : {"ON" if self.enable_prediction else "OFF"}'
+            + (f' (CPA horizon {self.cpa_horizon_s:.1f} s, '
+               f'miss {self.cpa_miss_distance:.1f} m)'
+               if self.enable_prediction else ''))
         self.get_logger().info('═══════════════════════════════════════════════')
 
     def _load_waypoints(self):
@@ -1311,6 +1425,234 @@ class MissionAvoidanceNode(Node):
         return wrap_pi(-math.pi + (b + 0.5) * bin_w), float(nearest[b]), float(ttc[b])
 
     # ══════════════════════════════════════════════════════════════════════
+    #  STEP 3b — Where will it BE? (optional, enable_prediction)
+    # ══════════════════════════════════════════════════════════════════════
+    #
+    # THE GAP THIS FILLS
+    # ------------------
+    # build_histogram() reduces the scan to one number per 5 deg sector, and
+    # imminent_collision() differences that array. What survives is a RADIAL
+    # range rate — how fast the gap is shrinking along each bearing. What is
+    # destroyed is the TANGENTIAL component, and that is the half that says
+    # where an obstacle is going.
+    #
+    # The consequence shows up as both kinds of error. A block crossing four
+    # metres clear of the drone closes range the whole way in and reads as a
+    # threat; a block on a genuine collision course holds a constant bearing,
+    # so if the speeds are comparable its closing rate is unremarkable and it
+    # reads as safe. The persistence filter, the cooldown and the committed
+    # bearings above are all, in part, compensation for a signal that cannot
+    # tell those two apart.
+    #
+    # Recovering the tangential component needs the scan treated as OBJECTS
+    # rather than bearings: cluster the raw beams, follow each cluster's
+    # centroid across frames, and the velocity falls out. Then the question
+    # "will we collide" is answered by geometry instead of inference.
+    #
+    # WHAT THIS LAYER IS NOT
+    # ----------------------
+    # It is not a replacement for imminent_collision(). Tracking fails in ways
+    # a reflex does not: an object passing behind a building drops its track,
+    # two objects crossing can swap identities, and a centroid computed from
+    # whichever face is visible drifts as the aspect changes. Every one of
+    # those produces a confident, wrong velocity. So the reflex keeps first
+    # refusal and this only ever ADDS a threat the reflex missed.
+
+    def cluster_scan(self):
+        """
+        Group the raw scan into objects. Returns [(cx, cy, n_beams, min_range)]
+        with centroids in WORLD coordinates.
+
+        Beams are walked in angular order and split wherever the range steps by
+        more than `track_cluster_gap` or drops out entirely. That is the whole
+        algorithm — for a 2D lidar looking at convex blocks it is equivalent to
+        the usual adjacency clustering and costs one pass.
+
+        Filtering matches build_histogram() exactly — same self-return cut,
+        same range limits, same tilt rejection — because a layer that
+        disagreed with the histogram about what exists would be worse than no
+        layer at all.
+        """
+        s = self.scan
+        if s is None or self.pos is None or len(s.ranges) == 0:
+            return []
+
+        r = np.asarray(s.ranges, dtype=float)
+        n = r.size
+        ang_body = s.angle_min + np.arange(n) * s.angle_increment
+        ang = ang_body + self.yaw
+
+        ok = (np.isfinite(r) & (r > self.self_filter_range) &
+              (r < s.range_max) & (r <= self.lookahead))
+        dz = (-math.sin(self.pitch) * np.cos(ang_body) +
+              math.cos(self.pitch) * math.sin(self.roll) * np.sin(ang_body))
+        ok &= np.abs(r * dz) <= self.max_beam_z_offset
+        if not np.any(ok):
+            return []
+
+        wx = self.pos[0] + r * np.cos(ang)
+        wy = self.pos[1] + r * np.sin(ang)
+
+        groups, cur = [], []
+        for i in range(n):
+            if not ok[i]:
+                if cur:
+                    groups.append(cur)
+                    cur = []
+                continue
+            if cur and abs(r[i] - r[cur[-1]]) > self.track_cluster_gap:
+                groups.append(cur)
+                cur = []
+            cur.append(i)
+        if cur:
+            groups.append(cur)
+
+        # THE SEAM. Beam 0 and beam n-1 are neighbours on a 360 deg scan, so an
+        # object sitting behind the drone is split by the wrap into two pieces.
+        # Left alone that produces two half-objects with centroids on either
+        # side of the real one, each below the beam count that makes an object
+        # credible, and both appearing and vanishing as the drone yaws — which
+        # would inject exactly the phantom velocities this layer must not have.
+        span = ang_body[-1] - ang_body[0] + s.angle_increment
+        if (len(groups) > 1 and span >= 2.0 * math.pi - 1e-6
+                and groups[0][0] == 0 and groups[-1][-1] == n - 1
+                and abs(r[0] - r[n - 1]) <= self.track_cluster_gap):
+            groups[0] = groups.pop() + groups[0]
+
+        out = []
+        for g in groups:
+            if len(g) < self.track_min_points:
+                continue
+            idx = np.asarray(g)
+            out.append((float(wx[idx].mean()), float(wy[idx].mean()),
+                        len(g), float(r[idx].min())))
+        return out
+
+    def update_tracks(self):
+        """
+        Associate this frame's clusters with the existing tracks and update
+        each one's position and velocity. No-op unless enable_prediction.
+
+        Association is greedy nearest-neighbour against the DEAD-RECKONED
+        position rather than the last measured one, so a track that is moving
+        is matched where it should have got to. The gate is `track_assoc_radius`
+        — at 1 m/s and 5-10 Hz an obstacle moves 0.1-0.2 m per frame, so 1.2 m
+        is loose enough to survive a dropped frame and far tighter than the
+        spacing between any two objects the drone actually meets.
+
+        The filter is alpha-beta: a fixed-gain constant-velocity estimator.
+        A full Kalman filter would buy a covariance this code has nothing to
+        spend it on, while alpha-beta needs no tuning beyond two numbers and
+        cannot go singular.
+
+        Centroid drift is the known weakness. The centroid of the VISIBLE face
+        moves as the aspect angle changes, so a static object seen from a
+        moving drone reports a small spurious velocity. That is precisely what
+        `track_min_speed` exists to swallow.
+        """
+        if not self.enable_prediction:
+            return
+
+        now = self.now()
+        clusters = self.cluster_scan()
+
+        # Forget anything not seen recently. Doing this BEFORE association
+        # means an occluded object is dropped rather than coasted indefinitely
+        # on a velocity nobody has confirmed since.
+        self.tracks = [t for t in self.tracks
+                       if now - t.t <= self.track_max_age_s]
+
+        used = set()
+        for tr in self.tracks:
+            dt = now - tr.t
+            if dt <= 1e-3:
+                continue
+            pred = tr.pos + tr.vel * dt
+            best, best_d = -1, self.track_assoc_radius
+            for i, c in enumerate(clusters):
+                if i in used:
+                    continue
+                d = math.hypot(c[0] - pred[0], c[1] - pred[1])
+                if d < best_d:
+                    best, best_d = i, d
+            if best < 0:
+                continue                       # ages out if this persists
+            used.add(best)
+            resid = np.array([clusters[best][0], clusters[best][1]]) - pred
+            tr.pos = pred + self.track_alpha * resid
+            tr.vel = tr.vel + (self.track_beta / dt) * resid
+            tr.t = now
+            tr.hits += 1
+
+        for i, c in enumerate(clusters):
+            if i not in used:
+                self.tracks.append(_Track((c[0], c[1]), now))
+
+        # In a street the scan can hold dozens of clusters. Only the
+        # best-established ones can ever clear track_confirm_frames anyway, so
+        # capping by hit count bounds the O(tracks * clusters) association
+        # without discarding anything that was going to matter.
+        if len(self.tracks) > self.track_max_count:
+            self.tracks.sort(key=lambda t: -t.hits)
+            self.tracks = self.tracks[:self.track_max_count]
+
+    def predict_threat(self):
+        """
+        Return (bearing, dist, t_cpa) for the soonest genuine intercept, or
+        None. Same tuple shape as imminent_collision() so the brake state
+        machine consumes it unchanged.
+
+        Four gates, and the order is the point. Each one is a reason to say
+        NOTHING, because the expensive error for this layer is the false
+        positive: a drone that brakes for traffic that was never going to hit
+        it stops making progress, and stopping in the open is how several of
+        these flights have ended.
+
+          1. UNCONFIRMED  — fewer than track_confirm_frames associations. A
+                            two-frame velocity is a difference of two centroid
+                            estimates and is mostly noise.
+          2. NOT MOVING   — below track_min_speed it is scenery, which VFH and
+                            the back-off reflex already handle better than a
+                            predictor would. Above track_max_speed nothing in
+                            this world moves that fast, so the association is
+                            wrong and the velocity is fiction.
+          3. NOT CLOSING  — t_cpa outside (0, cpa_horizon_s]. Negative means
+                            the gap is already opening; too far ahead means
+                            the constant-velocity assumption has expired
+                            before the intercept arrives.
+          4. WILL MISS    — d_cpa beyond cpa_miss_distance. This is the whole
+                            reason the layer exists: something can be close,
+                            and closing, and still pass harmlessly astern.
+        """
+        if not self.enable_prediction or self.pos is None:
+            return None
+
+        now = self.now()
+        own_p = np.asarray(self.pos[:2], dtype=float)
+        own_v = np.asarray(self.vel_enu[:2], dtype=float)
+
+        best = None
+        for tr in self.tracks:
+            if tr.hits < self.track_confirm_frames:
+                continue
+            if now - tr.t > self.track_max_age_s:
+                continue
+            speed = float(np.linalg.norm(tr.vel))
+            if not (self.track_min_speed <= speed <= self.track_max_speed):
+                continue
+            rel_p = tr.pos - own_p
+            rel_v = tr.vel - own_v
+            t_cpa, d_cpa = cpa(rel_p, rel_v)
+            if not (0.0 < t_cpa <= self.cpa_horizon_s):
+                continue
+            if d_cpa > self.cpa_miss_distance:
+                continue
+            if best is None or t_cpa < best[2]:
+                best = (math.atan2(float(rel_p[1]), float(rel_p[0])),
+                        float(np.linalg.norm(rel_p)), float(t_cpa))
+        return best
+
+    # ══════════════════════════════════════════════════════════════════════
     #  Main state machine
     # ══════════════════════════════════════════════════════════════════════
 
@@ -1515,6 +1857,22 @@ class MissionAvoidanceNode(Node):
         # A moving obstacle is never terrain. When something is closing, the
         # answer is to get out of its way.
         threat = self.imminent_collision(nearest)
+
+        # PREDICTIVE LAYER — strictly additive (enable_prediction, default off).
+        #
+        # The reflex above keeps first refusal: it is the guard that has been
+        # earned over several crashes, and this may add a threat it missed but
+        # may never remove one it found. What this buys is the case the reflex
+        # is blind to by construction — an obstacle whose closing rate looks
+        # ordinary because it is crossing rather than approaching, which is the
+        # geometry of every dynamic block on this course.
+        self.update_tracks()
+        if threat is None:
+            threat = self.predict_threat()
+            if threat is not None and not self.braking:
+                self.get_logger().warn(
+                    f'  🔮 PREDICTED INTERCEPT — {threat[1]:.1f} m at '
+                    f'{math.degrees(threat[0]):.0f}°, CPA in {threat[2]:.1f} s')
 
         # ── Proximity back-off: outranks EVERY other state ────────────────
         #

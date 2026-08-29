@@ -297,6 +297,9 @@ class MissionAvoidanceNode(Node):
         self.declare_parameter('brake_hold_s', 1.5)          # s to stay stopped
                                                             # after last detection
         self.declare_parameter('brake_stop_speed', 0.25)      # m/s = 'stopped'
+        self.declare_parameter('brake_creep_arc', 60.0)      # deg; do not creep
+                                                            # within this arc of
+                                                            # a known threat
         self.declare_parameter('terrain_close_range', 2.0)   # m
         self.declare_parameter('terrain_close_sectors', 12)  # simultaneous sectors
         self.declare_parameter('terrain_below_margin', 0.2)  # m the hit must sit
@@ -420,6 +423,7 @@ class MissionAvoidanceNode(Node):
         self.brake_stop_speed = p('brake_stop_speed').value
         self.terrain_close_range = p('terrain_close_range').value
         self.terrain_close_sectors = int(p('terrain_close_sectors').value)
+        self.brake_creep_arc = float(p('brake_creep_arc').value)
         self.enable_prediction = bool(p('enable_prediction').value)
         self.track_cluster_gap = float(p('track_cluster_gap').value)
         self.track_min_points = int(p('track_min_points').value)
@@ -482,6 +486,9 @@ class MissionAvoidanceNode(Node):
         self.last_evade_t = -99.0
         self.braking = False
         self.brake_until = 0.0
+        self.brake_threat_bearing = None   # bearing of whatever opened the
+                                           # window, so the creep cannot
+                                           # advance onto it
         self.vel_enu = np.zeros(2)    # own ENU velocity, for closing-rate maths
         self.vel_fused_t = -99.0      # last /mavros/.../velocity_local message
         self.vel_ok = False
@@ -1665,7 +1672,8 @@ class MissionAvoidanceNode(Node):
                         float(np.linalg.norm(rel_p)), float(t_cpa))
         return best
 
-    def brake_action(self, mode, heading, speed_now):
+    def brake_action(self, mode, heading, speed_now,
+                     threat_bearing=None):
         """
         What the brake state machine does on one tick. Returns a status string.
 
@@ -1686,7 +1694,23 @@ class MissionAvoidanceNode(Node):
             return 'EMERGENCY-BRAKE'
         if heading is None:
             return 'BRAKE-HOLD'
-        return 'BRAKE-CREEP' if mode == 'clear' else 'BRAKE-SIDESTEP'
+        if mode != 'clear':
+            return 'BRAKE-SIDESTEP'
+        # THE CREEP MUST NOT CLOSE ON THE THREAT.
+        #
+        # When mode == 'clear', `heading` IS the goal bearing — and a single
+        # moving block does not blank a wide enough arc to stop the histogram
+        # reading clear, so the goal bearing stays 'free' with the block
+        # sitting right on it. The first version of this crept at min_speed
+        # straight into what it had just braked for: on 2026-08-29 the threat
+        # held 20-23 deg off the nose while the gap went 5.9 -> 3.9 -> 1.6 m,
+        # and the flight ended in a LAND failsafe. Braking bought 4.9 s of
+        # warning and the creep spent all of it.
+        if (threat_bearing is not None
+                and abs(wrap_pi(heading - threat_bearing))
+                < math.radians(self.brake_creep_arc)):
+            return 'BRAKE-HOLD'
+        return 'BRAKE-CREEP'
 
     # ══════════════════════════════════════════════════════════════════════
     #  Main state machine
@@ -2225,6 +2249,7 @@ class MissionAvoidanceNode(Node):
             # Keep braking for a while after the last detection, so a single
             # crossing obstacle does not cause stop/go stuttering.
             self.brake_until = self.now() + self.brake_hold_s
+            self.brake_threat_bearing = t_bearing
 
         if self.now() < self.brake_until:
             # THE WINDOW IS NOT CANCELLABLE FROM IN HERE.
@@ -2249,19 +2274,27 @@ class MissionAvoidanceNode(Node):
             # instead of cruise, so it makes ground without charging back at
             # whatever it just braked for.
             self.status = self.brake_action(
-                mode, heading, float(np.linalg.norm(self.vel_enu)))
-            if self.status == 'EMERGENCY-BRAKE' or self.status == 'BRAKE-HOLD':
+                mode, heading, float(np.linalg.norm(self.vel_enu)),
+                self.brake_threat_bearing)
+            if self.status in ('EMERGENCY-BRAKE', 'BRAKE-HOLD'):
                 self.send_velocity(0.0, 0.0, self.climb_vz(), 0.0)
             else:
                 self.send_velocity(math.cos(heading) * self.min_speed,
                                    math.sin(heading) * self.min_speed,
                                    self.climb_vz(), 0.0)
+            # An uncancellable window must not also be a silent one. Every
+            # path here used to return before log_progress, so once the window
+            # stopped being cancelled the log went quiet for minutes with only
+            # the planner ticking — a dead aircraft looked like a slow one.
+            self.log_progress(leg_kind, dist, mode,
+                              float(np.min(nearest)))
             return
         else:
             if self.braking:
                 self.get_logger().info(
                     '  ✅ Brake window expired — resuming course.')
             self.braking = False
+            self.brake_threat_bearing = None
 
         # ── Normal steering ───────────────────────────────────────────────
         if mode == 'dodge':

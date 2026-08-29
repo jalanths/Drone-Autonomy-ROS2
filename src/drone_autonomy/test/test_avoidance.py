@@ -1457,6 +1457,67 @@ def main():
           f"(last detection t+{max(detections) * 0.1:.1f} s "
           f"+ brake_hold_s {node.brake_hold_s:.1f} s)")
 
+
+    # ── The creep must never advance ONTO the threat ──────────────────────
+    #
+    # BRAKE-CREEP as first written drove at `heading`, and when mode=='clear'
+    # `heading` IS the goal bearing. A small moving block does not blank a wide
+    # arc of the histogram, so the goal bearing reads clear while the block
+    # sits right on it — and the drone crept at min_speed straight into the
+    # thing it had just braked for.
+    #
+    # 2026-08-29, retrace breadcrumb 25, the flight this cost:
+    #
+    #   EMERGENCY BRAKE — obstacle 5.9 m at 20°, impact in 4.9 s
+    #   PREDICTED INTERCEPT — 3.9 m at 21°
+    #   PREDICTED INTERCEPT — 1.6 m at 23°
+    #   BACK-OFF — 1.35 m at 2°
+    #   BACK-OFF — 0.70 m at -147°
+    #   FCU left GUIDED (now 'LAND')
+    #
+    # The threat bearing never moved off the nose. Braking bought 4.9 s of
+    # warning and the creep spent all of it closing the gap.
+
+    kill = node.brake_action('clear', math.radians(20.0), 0.0,
+                             threat_bearing=math.radians(20.0))
+    check("creeping straight at the threat is refused — it HOLDS",
+          kill == 'BRAKE-HOLD',
+          f"got {kill}; the 2026-08-29 geometry was heading 20°, threat 20°")
+
+    check("a threat well off the nose still allows the creep",
+          node.brake_action('clear', 0.0, 0.0,
+                            threat_bearing=math.pi) == 'BRAKE-CREEP',
+          "something astern is not a reason to stop making ground")
+
+    check("a threat just inside the arc holds",
+          node.brake_action('clear', 0.0, 0.0,
+                            threat_bearing=math.radians(
+                                node.brake_creep_arc - 5.0)) == 'BRAKE-HOLD')
+    check("a threat just outside the arc creeps",
+          node.brake_action('clear', 0.0, 0.0,
+                            threat_bearing=math.radians(
+                                node.brake_creep_arc + 5.0)) == 'BRAKE-CREEP')
+    check("with no threat bearing known, the creep is allowed",
+          node.brake_action('clear', 0.0, 0.0, threat_bearing=None)
+          == 'BRAKE-CREEP',
+          "the window can outlive the last detection; that is its job")
+    check("momentum still outranks the creep question",
+          node.brake_action('clear', math.radians(20.0),
+                            node.brake_stop_speed + 0.1,
+                            threat_bearing=math.radians(20.0))
+          == 'EMERGENCY-BRAKE')
+
+    # The observability regression that made the failure undiagnosable: every
+    # brake-window path returned before log_progress, so a window that can no
+    # longer be cancelled meant minutes of silence with only the planner
+    # ticking. The run looked slow rather than dead.
+    bsrc2 = inspect.getsource(node.run_leg)
+    seg2 = bsrc2[bsrc2.find('if self.now() < self.brake_until:'):]
+    seg2 = seg2[:seg2.find('# ── Normal steering')]
+    check("the brake window still reports progress",
+          'log_progress' in seg2,
+          "an uncancellable window must not also be a silent one")
+
     node.destroy_node()
     rclpy.shutdown()
 

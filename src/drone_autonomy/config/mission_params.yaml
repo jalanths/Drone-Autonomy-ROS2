@@ -354,7 +354,7 @@ mission_avoidance_node:
     hard_stop_distance: 0.7   # m — fire regardless of the above; true last resort
 
     # ── Predicting where a dynamic obstacle will BE ────────────────────────
-    # OFF by default. Everything above measures where obstacles ARE; the
+    # ON by default. Everything above measures where obstacles ARE; the
     # sectorized histogram keeps only the RADIAL closing rate and throws away
     # the tangential component, which is the half that says where a thing is
     # going. This layer clusters the raw scan into objects, tracks their
@@ -366,8 +366,13 @@ mission_avoidance_node:
     # It is strictly ADDITIVE: consulted only when the reflex above found
     # nothing, and it can never suppress the reflex's own verdict.
     #
-    #   ros2 launch drone_autonomy autonomy_launch.py  (then set true here)
-    enable_prediction: false
+    # Set false to fly the pre-2026-08-29 behaviour exactly — every method in
+    # the layer returns immediately and nothing else changes. The A/B that
+    # made this the default: same build, same course, flag the only variable.
+    # ON reached all 6 waypoints, retraced and landed. OFF was disarmed at
+    # WP1 after 40 s, having descended 4.0 -> 0.7 m before it ever reported
+    # the block that hit it.
+    enable_prediction: true
     track_cluster_gap: 0.8    # m — a range step bigger than this separates two
                               # objects. Wider than the 0.3 m the blocks' own
                               # faces vary by, tighter than the gap to anything

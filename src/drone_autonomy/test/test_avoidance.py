@@ -1193,10 +1193,10 @@ def main():
         return S()
 
     # ── A. The flag genuinely gates the whole layer ───────────────────────
-    check("prediction is OFF by default",
-          node.get_parameter('enable_prediction').value is False,
-          "a new capability must not change how the aircraft flies "
-          "until it is asked for")
+    check("prediction is ON by default",
+          node.get_parameter('enable_prediction').value is True,
+          "earned on 2026-08-29: same build and course, flag the only "
+          "variable — ON flew the full mission, OFF was disarmed at WP1 in 40 s")
 
     reset_pred()
     node.enable_prediction = False
@@ -1381,6 +1381,81 @@ def main():
     check("the predictor is only consulted when the reflex found nothing",
           'if threat is None:' in src[i_ttc:i_pred],
           "additive layer, not a replacement")
+
+    print("\n── 33. The brake window must not be cancelled by a clear goal ─")
+    #
+    # brake_hold_s is documented as "stay stopped for this long after the last
+    # detection". It did not do that. The RESUME branch zeroed brake_until the
+    # moment `mode == 'clear'` — and `mode` is the VFH verdict about the GOAL
+    # BEARING, which a block crossing abeam leaves clear the entire time it is
+    # passing. So the window was cancelled on the tick after it opened.
+    #
+    # Measured on the 2026-08-29 prediction run: 144 emergency brakes and 18
+    # no-progress replans over 279 m — a brake every ~2 m. Brake, read clear,
+    # accelerate, re-detect, brake.
+    #
+    # These call node.brake_action() directly rather than a local copy of its
+    # conditions. Section 26 is why: a test helper that reimplemented a gate
+    # with fewer conditions than production passed twice while the real gate
+    # froze the drone twice.
+
+    check("still carrying momentum -> brake, whatever the histogram says",
+          node.brake_action('clear', 0.0,
+                            node.brake_stop_speed + 0.1) == 'EMERGENCY-BRAKE',
+          "stopping outranks steering")
+
+    # THE FIX. Stopped, goal bearing clear, brake window still open.
+    creep = node.brake_action('clear', 0.0, 0.0)
+    check("stopped with a clear goal -> CREEP, not a full resume",
+          creep == 'BRAKE-CREEP',
+          f"got {creep} — a clear goal bearing says nothing about whether "
+          f"the thing that caused the brake has gone")
+
+    check("stopped with the route blocked -> sidestep into a gap",
+          node.brake_action('dodge', 0.5, 0.0) == 'BRAKE-SIDESTEP')
+    check("stopped with NO legal heading -> hold position",
+          node.brake_action('dodge', None, 0.0) == 'BRAKE-HOLD',
+          "nothing is open — wait rather than invent a direction")
+    check("a clear goal with no heading still holds",
+          node.brake_action('clear', None, 0.0) == 'BRAKE-HOLD')
+
+    # The creep must actually be slower than cruise, or it is a resume by
+    # another name and buys nothing.
+    check("creep advances at min_speed, well under cruise",
+          0.0 < node.min_speed < node.cruise_speed,
+          f"{node.min_speed:.1f} m/s vs cruise {node.cruise_speed:.1f} m/s")
+
+    # The window may only ever expire on its own clock.
+    bsrc = inspect.getsource(node.run_leg)
+    seg = bsrc[bsrc.find('if self.now() < self.brake_until:'):]
+    seg = seg[:seg.find('# ── Normal steering')]
+    check("nothing inside the brake machine cancels brake_until",
+          'self.brake_until = 0.0' not in seg,
+          "it is refreshed on every threat tick, so letting it run out IS "
+          "brake_hold_s after the last detection")
+
+    # REPLAY the stutter. A crossing block is detected intermittently while
+    # the goal bearing reads clear throughout — the exact WP1 pattern.
+    clk['t'] = 1000.0
+    node.brake_until = 0.0
+    detections = [0, 1, 4, 5, 9]          # ticks on which a threat is reported
+    cancelled = 0
+    for tick in range(20):
+        clk['t'] = 1000.0 + tick * 0.1
+        if tick in detections:
+            node.brake_until = node.now() + node.brake_hold_s
+        if node.now() < node.brake_until:
+            # 'clear' every tick — the block is abeam, not on the goal bearing
+            if node.brake_action('clear', 0.0, 0.0) not in (
+                    'BRAKE-CREEP', 'BRAKE-HOLD', 'BRAKE-SIDESTEP'):
+                cancelled += 1
+    held_until = 1000.0 + max(detections) * 0.1 + node.brake_hold_s
+    check("the window survives 20 ticks of 'clear' and outlives the last "
+          "detection",
+          cancelled == 0 and abs(node.brake_until - held_until) < 1e-6,
+          f"holds to t+{node.brake_until - 1000.0:.2f} s "
+          f"(last detection t+{max(detections) * 0.1:.1f} s "
+          f"+ brake_hold_s {node.brake_hold_s:.1f} s)")
 
     node.destroy_node()
     rclpy.shutdown()

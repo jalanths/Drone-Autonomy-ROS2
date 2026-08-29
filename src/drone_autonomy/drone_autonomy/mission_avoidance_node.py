@@ -1869,10 +1869,17 @@ class MissionAvoidanceNode(Node):
         self.update_tracks()
         if threat is None:
             threat = self.predict_threat()
-            if threat is not None and not self.braking:
-                self.get_logger().warn(
+            if threat is not None:
+                # Throttled, not gated on `braking`. The first version tested
+                # `not self.braking` on the assumption that the flag stays set
+                # for the whole encounter — it does not. The RESUME branch
+                # below clears it on any tick the histogram reads 'clear',
+                # which for crossing traffic is most of them, so the guard
+                # reset constantly and one 279 m flight logged this 86 times.
+                self._throttled(
                     f'  🔮 PREDICTED INTERCEPT — {threat[1]:.1f} m at '
-                    f'{math.degrees(threat[0]):.0f}°, CPA in {threat[2]:.1f} s')
+                    f'{math.degrees(threat[0]):.0f}°, CPA in {threat[2]:.1f} s',
+                    2.0, key='predict')
 
         # ── Proximity back-off: outranks EVERY other state ────────────────
         #
@@ -2125,8 +2132,13 @@ class MissionAvoidanceNode(Node):
         #     Anything inside backoff_range disqualifies the terrain reading
         #     outright, whatever the sector count says.
         headroom = self.max_escape_alt - self.pos[2]
-        finite = nearest[np.isfinite(nearest)]
-        closest = float(np.min(finite)) if finite.size else float('inf')
+        # `nearest` holds only inf or finite positives — it is seeded to inf
+        # and written solely by np.minimum.at from ranges already filtered
+        # finite and positive — so np.min gives the closest obstacle if there
+        # is one and inf if the sky is empty. Both are exactly what this gate
+        # wants, so the mask-and-branch the check used to carry was dead
+        # weight on a 20 Hz path.
+        closest = float(np.min(nearest))
         if (close >= self.terrain_close_sectors
                 and headroom > 0.5
                 and threat is None

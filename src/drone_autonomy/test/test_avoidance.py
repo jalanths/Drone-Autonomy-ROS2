@@ -1382,6 +1382,97 @@ def main():
           'if threat is None:' in src[i_ttc:i_pred],
           "additive layer, not a replacement")
 
+    print("\n── 33. A catch-up tick must not manufacture a closing rate ────")
+    #
+    # imminent_collision() differences the per-sector range array and divides
+    # by the elapsed time. The guard against a degenerate interval was
+    # `dt <= 1e-3` — one millisecond — while the control period is 50 ms. Any
+    # tick landing between those two divides by an interval up to 50x too
+    # small and reports a closing rate up to 50x too large.
+    #
+    # That interval is not hypothetical. An rclpy timer that overruns its
+    # period fires again immediately to catch up, and the control loop
+    # overruns exactly when the drone is busy — i.e. near an obstacle. From
+    # the 2026-08-29 logs, brakes arrive at the 10 Hz scan rate with PAIRS
+    # 3-5 ms apart carrying different values:
+    #
+    #   1787988349.025   5.5 m at 178 deg
+    #   1787988349.030   3.7 m at 153 deg      <- 5 ms later, different threat
+    #
+    # 23 of 27 brake intervals in that flight were under 0.25 s. The guard
+    # was generating its own emergency, and each brake/resume pair is a
+    # velocity reversal at the estimator.
+    #
+    # The second half of the bug: prev_nearest was resampled BEFORE the dt
+    # check, so a rejected tick still destroyed the baseline the next good
+    # tick needed.
+
+    nbq = node.nbins
+    qbin = nbq // 4
+    node.vel_enu = np.zeros(2)
+    node.last_evade_t = -99.0
+    node.threat_ticks = np.zeros(nbq, dtype=int)
+    node.prev_nearest = None
+
+    def frame_at(r):
+        f = np.full(nbq, np.inf)
+        f[qbin] = r
+        return f
+
+    clk2 = {'t': 700.0}
+    node.now = lambda: clk2['t']
+
+    # Establish a baseline at a normal tick.
+    node.imminent_collision(frame_at(6.0))
+    base_snapshot = node.prev_nearest.copy()
+    base_t = node.prev_nearest_t
+
+    # A catch-up tick 5 ms later. The range moved 0.5 m — plausible binning
+    # noise — which over 5 ms reads as 100 m/s of closing.
+    clk2['t'] += 0.005
+    fired = node.imminent_collision(frame_at(5.5))
+    check("a 5 ms catch-up tick raises NO threat",
+          fired is None,
+          "0.5 m over 5 ms is 100 m/s; over the real 50 ms period it is 10")
+
+    check("...and the rejected tick does NOT resample the baseline",
+          node.prev_nearest_t == base_t
+          and np.array_equal(node.prev_nearest, base_snapshot),
+          "the next good tick still needs a full interval to difference over")
+
+    # The genuine article still fires: same 0.5 m, but over a real period.
+    node.prev_nearest = None
+    node.threat_ticks = np.zeros(nbq, dtype=int)
+    node.last_evade_t = -99.0
+    clk2['t'] = 800.0
+    real = None
+    for r in (6.0, 5.0, 4.0, 3.0, 2.0):
+        got = node.imminent_collision(frame_at(r))
+        if got is not None and real is None:
+            real = got
+        clk2['t'] += 0.1
+    check("a real 10 Hz approach still fires",
+          real is not None,
+          f"threat={real} — the fix must not deafen the guard")
+
+    # And the interleaved pattern from the flight: good tick, catch-up tick,
+    # good tick... only the good ones may be differenced.
+    node.prev_nearest = None
+    node.threat_ticks = np.zeros(nbq, dtype=int)
+    node.last_evade_t = -99.0
+    clk2['t'] = 900.0
+    spurious = 0
+    node.imminent_collision(frame_at(8.0))
+    for i in range(12):
+        clk2['t'] += 0.005                      # catch-up tick
+        if node.imminent_collision(frame_at(8.0 - i * 0.05)) is not None:
+            spurious += 1
+        clk2['t'] += 0.095                      # the rest of the period
+        node.imminent_collision(frame_at(8.0 - i * 0.05))
+    check("12 interleaved catch-up ticks produce no spurious threats",
+          spurious == 0,
+          f"{spurious} false brakes from timer jitter alone")
+
     node.destroy_node()
     rclpy.shutdown()
 

@@ -1360,12 +1360,41 @@ class MissionAvoidanceNode(Node):
         """
         now = self.now()
         prev, prev_t = self.prev_nearest, self.prev_nearest_t
-        self.prev_nearest, self.prev_nearest_t = nearest.copy(), now
         if prev is None:
+            self.prev_nearest, self.prev_nearest_t = nearest.copy(), now
             return None
         dt = now - prev_t
-        if dt <= 1e-3:
+
+        # A DERIVATIVE NEEDS A REAL INTERVAL.
+        #
+        # This divides a range difference by dt, so an interval far shorter
+        # than the sampling period reports a closing rate inflated by the same
+        # factor. The old guard rejected only dt <= 1 ms against a 50 ms
+        # control period, leaving a 50x window open.
+        #
+        # That window is not theoretical: an rclpy timer that overruns its
+        # period fires again immediately to catch up, and this loop overruns
+        # precisely when the drone is busy — which is when it is near
+        # something. The 2026-08-29 logs show brakes arriving at the 10 Hz
+        # scan rate with PAIRS 3-5 ms apart carrying different values:
+        #
+        #   1787988349.025   5.5 m at 178 deg
+        #   1787988349.030   3.7 m at 153 deg
+        #
+        # Half a period is the threshold because anything shorter cannot
+        # contain a fresh scan — the sensor runs at 10 Hz — so the difference
+        # is between two readings of the same sweep plus costmap jitter, which
+        # is noise by construction.
+        #
+        # And the baseline is NOT resampled on rejection. Overwriting it here
+        # was the worse half of the bug: a discarded tick still consumed the
+        # interval, so the next legitimate tick differenced over 5 ms instead
+        # of 50 and inherited exactly the inflation this guard exists to
+        # prevent.
+        if dt < 0.5 * self.dt:
             return None
+
+        self.prev_nearest, self.prev_nearest_t = nearest.copy(), now
 
         valid = np.isfinite(nearest) & np.isfinite(prev)
         if not np.any(valid):

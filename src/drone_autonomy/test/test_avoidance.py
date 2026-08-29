@@ -710,19 +710,47 @@ def main():
     check("and climbing is genuinely available in this scenario",
           node.climb_bounded() > 0.0, f"climb {node.climb_bounded():.2f} m/s")
 
-    # The gate itself: real headroom AND nothing closing.
-    def terrain_allowed(threat, z, ceiling):
+    # The gate itself. This helper MIRRORS THE PRODUCTION CONDITION and must
+    # be kept in step with it — a thinner copy is what let this branch pass
+    # its tests twice and still freeze the drone twice in flight.
+    def terrain_allowed(threat, z, ceiling, closest=99.0, braking_until=0.0):
         node.pos = np.array([0.0, 0.0, z])
         node.max_escape_alt = ceiling
+        node.brake_until = braking_until
         return (close >= node.terrain_close_sectors
                 and (node.max_escape_alt - node.pos[2]) > 0.5
-                and threat is None)
+                and threat is None
+                and node.now() >= node.brake_until
+                and closest > node.backoff_range)
 
     check("with headroom and nothing closing, the terrain climb still fires",
           terrain_allowed(None, 4.0, 12.0))
     check("with an obstacle closing, the terrain climb is suppressed",
           not terrain_allowed((math.radians(88.0), 4.1, 0.8), 4.0, 12.0),
           "TTC guard gets the tick instead of a zero-lateral hover")
+
+    # 2026-08-28, WP1 leg. BOTH earlier guards failed open on the same tick:
+    # braking had let the drone sag below 3.5 m so headroom opened up, and
+    # detection flickered through the persistence filter so threat was None.
+    # The node logged "SURFACE BENEATH: 16 sectors inside 2.0 m — climbing
+    # straight up, no lateral move" while a block closed 1.40 m -> 0.78 m,
+    # then "Crash: Disarming: AngErr=165>30".
+    check("a threat that flickered off THIS tick still suppresses terrain",
+          not terrain_allowed(None, 3.4, 4.0, closest=1.40,
+                              braking_until=clock['t'] + 1.0),
+          "the brake window carries the memory the instantaneous threat lacks")
+    check("something inside backoff_range is never ground",
+          not terrain_allowed(None, 3.4, 12.0, closest=1.40),
+          f"1.40 m < backoff_range {node.backoff_range:.1f} m — ground is what "
+          f"you hover ABOVE, not what you are retreating from")
+    check("the exact 2026-08-28 gate inputs are now refused",
+          not terrain_allowed(None, 3.4, 4.0, closest=1.40,
+                              braking_until=clock['t'] + 1.0),
+          "16 sectors, headroom 0.6 m, threat None, closest 1.40 m")
+    check("genuine ground at a safe range still climbs",
+          terrain_allowed(None, 4.0, 12.0, closest=1.8),
+          f"1.8 m clears backoff_range {node.backoff_range:.1f} m and still "
+          f"trips the sector count")
     # The 4 m cap case: sagging to 3.99 m under a 4.0 m ceiling used to satisfy
     # climb_bounded() > 0 and surrender all lateral mobility for 0.01 m of
     # height. That is what dyn_block_3 flew into on 2026-08-27.

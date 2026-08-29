@@ -1738,10 +1738,42 @@ class MissionAvoidanceNode(Node):
         # Requiring REAL headroom makes the branch inert under the 4 m cap,
         # where climbing was never an answer, while leaving it intact if the
         # ceiling is ever raised.
+        #
+        # 2026-08-28: BOTH of those guards failed open at once and the same
+        # thing happened again, this time on the WP1 leg.
+        #
+        #   EMERGENCY BRAKE - obstacle 5.1 m at 178 deg
+        #   EMERGENCY BRAKE - obstacle 2.8 m at -172 deg
+        #   BACK-OFF - 1.40 m at -178 deg, retreating along 2 deg
+        #   SURFACE BENEATH: 16 sectors inside 2.0 m - climbing straight up,
+        #                    no lateral move
+        #   BACK-OFF - 0.78 m
+        #   Crash: Disarming: AngErr=165>30
+        #
+        # `headroom > 0.5` was satisfied because braking had let the drone sag
+        # below 3.5 m, and `threat is None` was satisfied because detection
+        # flickers through the persistence filter — one tick without a report
+        # is all this branch needs to surrender lateral movement.
+        #
+        # Height cannot separate the two cases: a 3 m block beside a drone at
+        # 3.4 m genuinely does return hits below it. Two things can, and both
+        # are checked now:
+        #
+        #   * the brake window, not the instantaneous threat. A moving block
+        #     does not stop existing because one scan missed it, and
+        #     brake_until already carries brake_hold_s of memory.
+        #   * plain proximity. Ground is what you hover ABOVE; it is not what
+        #     sits 1.4 m from you while the back-off reflex retreats from it.
+        #     Anything inside backoff_range disqualifies the terrain reading
+        #     outright, whatever the sector count says.
         headroom = self.max_escape_alt - self.pos[2]
+        finite = nearest[np.isfinite(nearest)]
+        closest = float(np.min(finite)) if finite.size else float('inf')
         if (close >= self.terrain_close_sectors
                 and headroom > 0.5
-                and threat is None):
+                and threat is None
+                and self.now() >= self.brake_until
+                and closest > self.backoff_range):
             self.status = 'TERRAIN-CLIMB'
             self.target_alt = min(max(self.target_alt, self.pos[2]) + self.escape_step,
                                   self.max_escape_alt)

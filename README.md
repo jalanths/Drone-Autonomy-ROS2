@@ -21,7 +21,7 @@ colcon build --packages-select drone_autonomy
 The script sequences the whole stack in the one order that works, waits for the
 FCU heartbeat, then streams the mission log. Logs land in `.run_logs/`.
 
-Offline test of the avoidance maths (no simulator needed, ~5 s):
+Offline test of the avoidance maths (no simulator needed, ~5 seconds):
 
 ```bash
 python3 src/drone_autonomy/test/test_avoidance.py

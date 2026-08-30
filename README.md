@@ -1,8 +1,9 @@
 # Drone Autonomy in ROS 2 🚁
 
-Autonomous 6-waypoint navigation with **dynamic obstacle avoidance** and **smart
-retrace**, built on ROS 2 Humble + MAVROS + Nav2 costmaps, simulated with
-ArduPilot SITL + Gazebo Classic 11, and visualised in RViz2.
+Autonomous 6-waypoint navigation with **dynamic obstacle avoidance**, a
+**motion-prediction layer** that projects where moving obstacles will be, and
+**smart retrace**, built on ROS 2 Humble + MAVROS + Nav2 costmaps, simulated
+with ArduPilot SITL + Gazebo Classic 11, and visualised in RViz2.
 
 ```
 ARM → TAKEOFF → WP1 … WP6  (live avoidance) → SMART RETRACE → LAND
@@ -89,6 +90,70 @@ setpoints in, so no hidden conversion remains.
 5. **Emergency reflex** — a last-ditch check reverses the drone if anything is
    inside 2 m of the chosen heading.
 
+### Predicting where a moving obstacle will be
+
+Steps 1–5 above are **static-geometry** reasoning: they ask which bearings are
+free *right now*. Against something that moves, that is always one frame late —
+note #16 covers being hit broadside by exactly this. The TTC reflex added there
+patched the symptom, but it inherits a deeper limit: `nearest[72]` keeps only
+each sector's range, so differencing it recovers **radial** closing rate and
+throws away **tangential** motion — the component that says where the obstacle
+is actually going.
+
+The predictive layer keeps that component by tracking objects instead of
+sectors:
+
+1. **Cluster** — walk the raw scan in angular order and split wherever a beam is
+   invalid or the range steps by more than `track_cluster_gap`. Clusters below
+   `track_min_points` beams are speckle. The ±180° seam is merged so an object
+   straddling it is one cluster, not two.
+2. **Associate** — greedy nearest-neighbour against each track's dead-reckoned
+   position `pos + vel·dt`, gated by `track_assoc_radius`.
+3. **Estimate** — a fixed-gain **alpha-beta filter** per track, the
+   constant-velocity estimator that costs two multiplies and no matrix:
+
+   ```
+   pred  = pos + vel·dt
+   resid = measurement − pred
+   pos   = pred + α·resid
+   vel   = vel  + (β/dt)·resid
+   ```
+
+4. **Project** — for a track with velocity, the **closest point of approach**
+   against the drone's own velocity has a closed form:
+
+   ```
+   t_cpa = −(Δp · Δv) / |Δv|²        d_cpa = |Δp + Δv·t_cpa|
+   ```
+
+   Two degenerate cases have to be caught rather than divided through:
+   `|Δv| ≈ 0` is an obstacle station-keeping alongside, and `t_cpa ≤ 0` means the
+   closest approach is in the *past* — the pair is already opening.
+
+A warning is raised only if the track is confirmed over `track_confirm_frames`,
+is currently moving (`track_min_speed … track_max_speed` — stationary scenery is
+VFH's job), intercepts within `cpa_horizon_s`, and misses by less than
+`cpa_miss_distance`.
+
+The layer is **strictly additive**: `predict_threat()` is consulted only when
+`imminent_collision()` found nothing, so the reflex keeps first refusal and
+prediction can only ever *add* warnings the reflex would have missed. In flight
+it fires several seconds ahead of the reflex:
+
+```
+🔮 PREDICTED INTERCEPT — 6.6 m at 149°, CPA in 4.9 s
+🔮 PREDICTED INTERCEPT — 4.2 m at 147°, CPA in 3.4 s
+🔮 PREDICTED INTERCEPT — 1.9 m at 138°, CPA in 1.7 s
+```
+
+**What this does and does not buy.** Detection is genuinely earlier and it is
+repeatable. The *response* to that warning is still the same emergency brake,
+and braking answers a **crossing** obstacle, not a **pursuing** one — under the
+4 m ceiling a closing obstacle has nowhere to go. Earlier detection is a
+prerequisite for a better response, not a better response by itself. See
+[Verified end-to-end](#-verified-end-to-end) for what that means for mission
+reliability.
+
 ### Smart retrace
 
 Outbound, the drone drops a breadcrumb every 4 m **only at moments when its path
@@ -142,6 +207,31 @@ Waypoints are authored in **Gazebo world coordinates** (what you see in the GUI)
 and converted internally. The ArduPilot plugin declares a 180° roll in
 `<gazeboXYZToNED>`, giving `ENU = (−gz_y, +gz_x, +gz_z)`. Set
 `waypoint_frame: 'enu'` to bypass the conversion.
+
+### Predictive-layer knobs
+
+Set `enable_prediction: false` to disable the tracker entirely and fall back to
+the reflex-only behaviour of note #16.
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `track_cluster_gap` | 0.8 m | range step that separates two objects |
+| `track_min_points` | 3 beams | fewer is speckle, not an object |
+| `track_assoc_radius` | 1.2 m | how far a centroid may move between frames |
+| `track_confirm_frames` | 4 | associations before the velocity is believed |
+| `track_max_age_s` | 0.6 s | unseen → forget it, rather than dead-reckon |
+| `track_min_speed` | 0.35 m/s | below this it is scenery; VFH handles it |
+| `track_max_speed` | 5.0 m/s | above this the association is wrong |
+| `track_alpha` / `track_beta` | 0.5 / 0.25 | alpha-beta position / velocity gains |
+| `track_max_count` | 12 | bounds association cost on a busy street |
+| `cpa_horizon_s` | 5.0 s | ignore intercepts further off than this |
+| `cpa_miss_distance` | 2.0 m | a predicted gap tighter than this is a hit |
+
+The two age-related limits carry most of the weight. `track_max_age_s` is short
+on purpose — a track that coasts on dead reckoning behind a building is how a
+confidently wrong answer gets produced — and `cpa_horizon_s` is short because
+constant velocity models a block on a straight patrol leg well and its
+turnaround badly.
 
 ---
 
@@ -642,7 +732,62 @@ Commitment plus a measured exit test is the whole difference. The direction
 cannot oscillate because it is latched, and the detour cannot end early
 because ending it requires a distance the trap cannot produce.
 
-### 22. Smaller fixes
+### 22. A block 1.4 m away is not the ground
+
+`TERRAIN-CLIMB` exists so the drone gains height when the scan fills with close
+returns in many directions — the signature of rising ground it is about to fly
+into. A **dynamic block at 1.4 m produces that same signature**, and the drone
+answered a collision by climbing into it, at a cruise altitude already pinned to
+the 4 m ceiling so the climb had nowhere to go.
+
+The reading "many sectors are close" is genuinely ambiguous; what disambiguates
+it is the rest of the frame. Terrain is diffuse and far — a single object
+sitting inside the back-off range is not terrain, and neither is anything the
+collision guard has already ruled on:
+
+```python
+if (close >= self.terrain_close_sectors
+        and headroom > 0.5
+        and threat is None                  # the reflex has not called this
+        and self.now() >= self.brake_until  # not inside a brake window
+        and closest > self.backoff_range):  # nothing is that close
+    self.status = 'TERRAIN-CLIMB'
+```
+
+The last three clauses are the fix: they hand any *near* reading to the
+collision path and leave terrain the diffuse case it was written for.
+
+### 23. A catch-up tick manufactured a closing rate out of noise
+
+The TTC guard from #16 differences the per-sector nearest ranges against the
+previous tick and divides by `dt`. Its only protection was `dt > 1 ms`, against
+a **50 ms** control period — a 50× window left open.
+
+That window is not theoretical. An rclpy timer that overruns its period fires
+again *immediately* to catch up, and this loop overruns precisely when the drone
+is busy, which is when it is near something. Logs show brake pairs 3–5 ms apart
+carrying different values:
+
+```
+1787988349.025   5.5 m at 178°
+1787988349.030   3.7 m at 153°
+```
+
+At `dt` = 5 ms, 0.5 m of ordinary scan noise reports as **100 m/s** of closing
+speed. Every catch-up tick was a coin flip on a false emergency brake.
+
+The guard now requires half a real period, `dt >= 0.5 · self.dt`. The subtler
+half is what it must *not* do: a rejected tick must **not** resample the
+baseline. Storing `nearest` on the way out would leave the next good tick
+differencing against a 5 ms-old frame — the same tiny interval, one tick later,
+with the guard satisfied. The early return leaves the old baseline in place so
+the next comparison spans a full interval.
+
+Covered by section 33 of the test suite, including twelve interleaved catch-up
+ticks producing zero spurious threats, and a real 10 Hz approach still firing —
+a guard that deafens the reflex is not a fix.
+
+### 24. Smaller fixes
 
 - `setup.py` registered `lidar_publisher_node` pointing at a module deleted in
   the `fake_lidar_node → virtual_lidar_node` rename; `ros2 run` on it always
@@ -658,31 +803,62 @@ because ending it requires a distance the trap cannot produce.
 
 ## ✅ Verified end-to-end
 
-Full autonomous run against Gazebo + ArduPilot SITL, headless:
+Full autonomous run against Gazebo + ArduPilot SITL, headless, prediction
+enabled (2026-08-30):
 
 ```
 ✈️  MISSION START — 6 waypoints
-📍 WAYPOINT 1/6 REACHED  [ 55 m flown,  32 s, 10 dodges]
-📍 WAYPOINT 2/6 REACHED  [102 m flown,  55 s, 20 dodges]   ← skyscraper leg
-📍 WAYPOINT 3/6 REACHED  [141 m flown,  78 s, 31 dodges]   ← canyon crossing
-📍 WAYPOINT 4/6 REACHED  [182 m flown,  96 s, 45 dodges]
-📍 WAYPOINT 5/6 REACHED  [271 m flown, 144 s, 75 dodges]
-📍 WAYPOINT 6/6 REACHED  [350 m flown, 176 s, 96 dodges]   ← suburb crossing
+📍 WAYPOINT 1/6 REACHED  [ 40 m flown,  59 s, 19 dodges]
+📍 WAYPOINT 2/6 REACHED  [ 94 m flown, 145 s, 27 dodges]   ← skyscraper leg
+📍 WAYPOINT 3/6 REACHED  [129 m flown, 203 s, 38 dodges]   ← canyon crossing
+📍 WAYPOINT 4/6 REACHED  [171 m flown, 268 s, 61 dodges]
+📍 WAYPOINT 5/6 REACHED  [226 m flown, 347 s, 83 dodges]
+📍 WAYPOINT 6/6 REACHED  [280 m flown, 438 s, 92 dodges]   ← suburb crossing
 🔁 SMART RETRACE — following proven-clear breadcrumbs home
 🏁 Retrace complete — home reached.
 ✅ MISSION COMPLETE — landed and disarmed
-   📏 Distance flown : 664 m
-   ⏱️  Duration       : 390 s
-   🛡️  Obstacle dodges: 283
+   📏 Distance flown : 534 m
+   ⏱️  Duration       : 860 s
+   🛡️  Obstacle dodges: 233
 ```
+
+That flight logged **51 predicted intercepts** alongside 158 reflex brakes, and
+held 4.0 m for its entire duration.
 
 Perception chain confirmed live: Gazebo LiDAR → `/scan` (360 beams, 30 m) → TF
 → Nav2 costmap populated with ~10 000 blocked cells → fused polar histogram →
 ENU velocity setpoints → ArduPilot GUIDED.
 
-The avoidance core is also covered by 11 offline checks
-(`src/drone_autonomy/test/test_avoidance.py`), including a regression test for
-the needle-gap bug in #7.
+### Reliability — the honest number
+
+A completed mission is **not yet repeatable**. A five-run soak on this same
+build, unattended and identical apart from the simulator's own nondeterminism,
+completed **0 of 5**: two land-failsafes, two mid-mission disarms, and one run
+that never armed because the Nav2 costmap did not come up.
+
+The dominant failure mode is not the perception stack, which behaves. It is the
+**brake/resume cycle**: with the goal bearing reading clear, the brake window is
+cancelled on the same tick it opens, so the drone alternates brake and cruise at
+scan rate. The resulting velocity thrash is what trips the EKF and ends the
+flight. Two attempts to hold the window open instead improved every targeted
+metric — cancellations 123 → 0, brakes 144 → 54, dodges 120 → 74 — and still
+lost the aircraft, so the change was reverted rather than kept on a metric that
+was not the outcome.
+
+Worth stating plainly, since single runs are what tempt you here: the *same*
+configuration produced both the best and the worst outcome of the campaign. Any
+A/B conclusion drawn from one flight of each — including several drawn during
+this work and later withdrawn — is noise. The soak harness exists because that
+kept happening.
+
+**Offline, the picture is much firmer:** 146 checks over the avoidance maths run
+in ~5 s with no simulator, covering every numbered defect below that can be
+expressed as geometry — the needle gap in #7, the terrain gate in #22, catch-up
+ticks in #23, and the CPA layer end to end.
+
+```bash
+python3 src/drone_autonomy/test/test_avoidance.py
+```
 
 ## 📦 Package layout
 
@@ -696,8 +872,13 @@ src/drone_autonomy/
 │   ├── virtual_lidar_node.py         fake /scan for SITL without Gazebo
 │   └── {takeoff,waypoint_nav,obstacle_nav,nav2_obstacle}_node.py   legacy demos
 ├── launch/{sim,autonomy}_launch.py
-├── config/   worlds/   test/
+├── test/test_avoidance.py          146 offline checks, no simulator
+├── config/   worlds/
 ```
+
+`mission_avoidance_node.py` carries the whole brain: VFH+ steering, the TTC
+reflex, the cluster/alpha-beta/CPA prediction layer, A* replanning, tangent-bug
+boundary following, and the breadcrumb retrace.
 
 The legacy demo nodes are kept for reference. They use
 `/mavros/setpoint_position/global`, which needs the `setpoint_position` plugin —
